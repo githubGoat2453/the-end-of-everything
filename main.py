@@ -14,35 +14,59 @@ DB_NAME = "bot.db"
 # In-memory rejoin cooldowns: {user_id: unix_timestamp_until_allowed}
 cooldowns = {}
 
-# Daily stats for summary
-daily_stats = {
-    "approved": 0,
-    "denied": 0,
-    "blacklisted": 0,
-    "autokicked": 0,
-    "joins": []
-}
+# Per-guild daily stats: {guild_id: {...}}
+daily_stats = {}
 
 # =========================
-# CONFIG
+# CONFIG (PER GUILD)
 # =========================
-config = {
-    "log_channel": None,
-    "category": None,
-    "male_role": None,
-    "female_role": None,
-    "unverified_role": None,
-    "staff_role": None
-}
+# config[guild_id] = {
+#   "log_channel": int,
+#   "category": int,
+#   "male_role": int,
+#   "female_role": int,
+#   "unverified_role": int,
+#   "staff_role": int
+# }
+config = {}
+
+def get_guild_config(guild_id: int):
+    if guild_id not in config:
+        config[guild_id] = {
+            "log_channel": None,
+            "category": None,
+            "male_role": None,
+            "female_role": None,
+            "unverified_role": None,
+            "staff_role": None
+        }
+    return config[guild_id]
+
+def get_daily_stats(guild_id: int):
+    if guild_id not in daily_stats:
+        daily_stats[guild_id] = {
+            "approved": 0,
+            "denied": 0,
+            "blacklisted": 0,
+            "autokicked": 0,
+            "joins": []
+        }
+    return daily_stats[guild_id]
 
 # =========================
 # DATABASE INIT
 # =========================
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
+        # Drop old single-server tables if they exist (clean reset for multi-server)
+        await db.execute("DROP TABLE IF EXISTS blacklist")
+        await db.execute("DROP TABLE IF EXISTS config")
+
         await db.execute("""
         CREATE TABLE IF NOT EXISTS blacklist (
-            user_id INTEGER PRIMARY KEY
+            guild_id INTEGER,
+            user_id INTEGER,
+            PRIMARY KEY (guild_id, user_id)
         )
         """)
 
@@ -55,47 +79,61 @@ async def init_db():
 
         await db.execute("""
         CREATE TABLE IF NOT EXISTS config (
-            key TEXT PRIMARY KEY,
-            value INTEGER
+            guild_id INTEGER,
+            key TEXT,
+            value INTEGER,
+            PRIMARY KEY (guild_id, key)
         )
         """)
+
         await db.commit()
 
 # =========================
 # DB HELPERS
 # =========================
-async def add_blacklist(user_id):
+async def add_blacklist(guild_id, user_id):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO blacklist (user_id) VALUES (?)", (user_id,))
+        await db.execute(
+            "INSERT OR REPLACE INTO blacklist (guild_id, user_id) VALUES (?, ?)",
+            (guild_id, user_id)
+        )
         await db.commit()
 
-async def remove_blacklist(user_id):
+async def remove_blacklist(guild_id, user_id):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM blacklist WHERE user_id=?", (user_id,))
+        await db.execute(
+            "DELETE FROM blacklist WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        )
         await db.commit()
 
-async def is_blacklisted(user_id):
+async def is_blacklisted(guild_id, user_id):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM blacklist WHERE user_id=?", (user_id,)) as cursor:
+        async with db.execute(
+            "SELECT user_id FROM blacklist WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ) as cursor:
             return await cursor.fetchone() is not None
 
-async def save_config():
+async def save_config_for_guild(guild_id):
+    guild_cfg = get_guild_config(guild_id)
     async with aiosqlite.connect(DB_NAME) as db:
-        for key, value in config.items():
+        for key, value in guild_cfg.items():
             if value is not None:
                 await db.execute(
-                    "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-                    (key, value)
+                    "INSERT OR REPLACE INTO config (guild_id, key, value) VALUES (?, ?, ?)",
+                    (guild_id, key, value)
                 )
         await db.commit()
 
 async def load_config():
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT key, value FROM config") as cursor:
+        async with db.execute("SELECT guild_id, key, value FROM config") as cursor:
             rows = await cursor.fetchall()
-            for key, value in rows:
-                if key in config:
-                    config[key] = value
+            for guild_id, key, value in rows:
+                guild_cfg = get_guild_config(guild_id)
+                if key in guild_cfg:
+                    guild_cfg[key] = value
 
 async def set_requirement(gender, text):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -118,7 +156,8 @@ async def get_requirement(gender):
 # LOGGING
 # =========================
 async def log_action(guild, title, description, color=0x2b2d31, *, fields=None):
-    log_channel_id = config.get("log_channel")
+    guild_cfg = get_guild_config(guild.id)
+    log_channel_id = guild_cfg.get("log_channel")
     if not log_channel_id:
         return
 
@@ -144,12 +183,13 @@ async def log_action(guild, title, description, color=0x2b2d31, *, fields=None):
         print(f"Failed to log action: {e}")
 
 # =========================
-# SETUP COMMAND
+# SETUP COMMAND (PER GUILD)
 # =========================
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setup(ctx):
     guild = ctx.guild
+    guild_cfg = get_guild_config(guild.id)
 
     male = await guild.create_role(name="Male", color=discord.Color.blue())
     female = await guild.create_role(name="Female", color=discord.Color.from_rgb(255, 105, 180))
@@ -188,7 +228,7 @@ async def setup(ctx):
         except:
             pass
 
-    config.update({
+    guild_cfg.update({
         "log_channel": log_channel.id,
         "category": category.id,
         "male_role": male.id,
@@ -197,8 +237,8 @@ async def setup(ctx):
         "staff_role": staff.id
     })
 
-    await save_config()
-    await ctx.send("✅ Setup complete")
+    await save_config_for_guild(guild.id)
+    await ctx.send("✅ Setup complete for this server.")
 
     await log_action(
         guild,
@@ -208,14 +248,14 @@ async def setup(ctx):
     )
 
 # =========================
-# REQUIREMENTS COMMAND
+# REQUIREMENTS COMMAND (SHARED)
 # =========================
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def requirements(ctx, gender, *, text):
     gender = gender.lower()
     await set_requirement(gender, text)
-    await ctx.send(f"✅ Requirement set for {gender}")
+    await ctx.send(f"✅ Requirement set for {gender} (shared across all servers).")
 
     await log_action(
         ctx.guild,
@@ -229,13 +269,13 @@ async def requirements(ctx, gender, *, text):
     )
 
 # =========================
-# UNBLACKLIST
+# UNBLACKLIST (PER GUILD)
 # =========================
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def unblacklist(ctx, user_id: int):
-    await remove_blacklist(user_id)
-    await ctx.send(f"✅ Unblacklisted {user_id}")
+    await remove_blacklist(ctx.guild.id, user_id)
+    await ctx.send(f"✅ Unblacklisted {user_id} in this server.")
 
     await log_action(
         ctx.guild,
@@ -335,31 +375,37 @@ class TicketControls(discord.ui.View):
         self.gender = gender
 
     def is_staff(self, interaction):
-        staff_role = interaction.guild.get_role(config["staff_role"])
-        return interaction.user.guild_permissions.administrator or staff_role in interaction.user.roles
+        guild_cfg = get_guild_config(interaction.guild.id)
+        staff_role = interaction.guild.get_role(guild_cfg["staff_role"]) if guild_cfg["staff_role"] else None
+        return interaction.user.guild_permissions.administrator or (staff_role and staff_role in interaction.user.roles)
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction, button):
         if not self.is_staff(interaction):
             return await interaction.response.send_message("Staff only", ephemeral=True)
 
+        guild_cfg = get_guild_config(interaction.guild.id)
+        stats = get_daily_stats(interaction.guild.id)
+
         member = interaction.guild.get_member(self.user_id)
 
-        male = interaction.guild.get_role(config["male_role"])
-        female = interaction.guild.get_role(config["female_role"])
-        unverified = interaction.guild.get_role(config["unverified_role"])
+        male = interaction.guild.get_role(guild_cfg["male_role"])
+        female = interaction.guild.get_role(guild_cfg["female_role"])
+        unverified = interaction.guild.get_role(guild_cfg["unverified_role"])
 
-        await member.remove_roles(unverified)
+        if unverified in member.roles:
+            await member.remove_roles(unverified)
 
         role = male if self.gender == "male" else female
-        await member.add_roles(role)
+        if role:
+            await member.add_roles(role)
 
         try:
             await member.send("✅ You have been approved and verified.")
         except:
             pass
 
-        daily_stats["approved"] += 1
+        stats["approved"] += 1
 
         await log_action(
             interaction.guild,
@@ -383,6 +429,9 @@ class TicketControls(discord.ui.View):
         if not self.is_staff(interaction):
             return await interaction.response.send_message("Staff only", ephemeral=True)
 
+        guild_cfg = get_guild_config(interaction.guild.id)
+        stats = get_daily_stats(interaction.guild.id)
+
         member = interaction.guild.get_member(self.user_id)
 
         try:
@@ -392,7 +441,7 @@ class TicketControls(discord.ui.View):
 
         await member.kick(reason="Denied")
 
-        daily_stats["denied"] += 1
+        stats["denied"] += 1
 
         await log_action(
             interaction.guild,
@@ -416,9 +465,12 @@ class TicketControls(discord.ui.View):
         if not self.is_staff(interaction):
             return await interaction.response.send_message("Staff only", ephemeral=True)
 
+        guild_cfg = get_guild_config(interaction.guild.id)
+        stats = get_daily_stats(interaction.guild.id)
+
         member = interaction.guild.get_member(self.user_id)
 
-        await add_blacklist(member.id)
+        await add_blacklist(interaction.guild.id, member.id)
 
         try:
             await member.send("🚫 You have been blacklisted from this server.")
@@ -427,7 +479,7 @@ class TicketControls(discord.ui.View):
 
         await member.kick(reason="Blacklisted")
 
-        daily_stats["blacklisted"] += 1
+        stats["blacklisted"] += 1
 
         await log_action(
             interaction.guild,
@@ -535,15 +587,18 @@ async def auto_kick_if_unverified(member_id, guild_id, delay=600):
     if not member:
         return
 
-    unverified_role = guild.get_role(config["unverified_role"])
-    if unverified_role in member.roles:
+    guild_cfg = get_guild_config(guild.id)
+    stats = get_daily_stats(guild.id)
+
+    unverified_role = guild.get_role(guild_cfg["unverified_role"]) if guild_cfg["unverified_role"] else None
+    if unverified_role and unverified_role in member.roles:
         try:
             await member.send("⏰ You did not complete verification in time and were removed from the server.")
         except:
             pass
         await member.kick(reason="Verification timeout")
 
-        daily_stats["autokicked"] += 1
+        stats["autokicked"] += 1
 
         await log_action(
             guild,
@@ -561,7 +616,9 @@ async def auto_kick_if_unverified(member_id, guild_id, delay=600):
 # MEMBER JOIN / CONFIG
 # =========================
 async def ensure_config(guild):
-    if any(v is None for v in config.values()):
+    guild_cfg = get_guild_config(guild.id)
+
+    if any(v is None for v in guild_cfg.values()):
         male = discord.utils.get(guild.roles, name="Male")
         female = discord.utils.get(guild.roles, name="Female")
         unverified = discord.utils.get(guild.roles, name="Unverified")
@@ -570,7 +627,7 @@ async def ensure_config(guild):
         log_channel = discord.utils.get(guild.text_channels, name="verification-logs")
 
         if all([male, female, unverified, staff, category, log_channel]):
-            config.update({
+            guild_cfg.update({
                 "log_channel": log_channel.id,
                 "category": category.id,
                 "male_role": male.id,
@@ -578,7 +635,7 @@ async def ensure_config(guild):
                 "unverified_role": unverified.id,
                 "staff_role": staff.id
             })
-            await save_config()
+            await save_config_for_guild(guild.id)
 
             await log_action(
                 guild,
@@ -589,10 +646,14 @@ async def ensure_config(guild):
 
 @bot.event
 async def on_member_join(member):
-    await ensure_config(member.guild)
+    guild = member.guild
+    guild_cfg = get_guild_config(guild.id)
+    stats = get_daily_stats(guild.id)
 
-    if any(v is None for v in config.values()):
-        print(f"Config not set up for guild {member.guild.name}, skipping member join.")
+    await ensure_config(guild)
+
+    if any(v is None for v in guild_cfg.values()):
+        print(f"Config not set up for guild {guild.name}, skipping member join.")
         return
 
     # Anti-rejoin cooldown
@@ -604,7 +665,7 @@ async def on_member_join(member):
         await member.kick(reason="Rejoin cooldown")
 
         await log_action(
-            member.guild,
+            guild,
             "🔁 Rejoin Cooldown Kick",
             f"{member.mention} was kicked for rejoining too quickly.",
             color=0xED4245,
@@ -615,11 +676,11 @@ async def on_member_join(member):
         )
         return
 
-    if await is_blacklisted(member.id):
+    if await is_blacklisted(guild.id, member.id):
         await member.kick(reason="Blacklisted")
 
         await log_action(
-            member.guild,
+            guild,
             "🚫 Blacklisted User Attempted To Join",
             f"{member.mention} attempted to join but is blacklisted.",
             color=0xED4245,
@@ -630,13 +691,12 @@ async def on_member_join(member):
         )
         return
 
-    guild = member.guild
+    unverified = guild.get_role(guild_cfg["unverified_role"])
+    if unverified:
+        await member.add_roles(unverified)
 
-    unverified = guild.get_role(config["unverified_role"])
-    await member.add_roles(unverified)
-
-    category = guild.get_channel(config["category"])
-    staff_role = guild.get_role(config["staff_role"])
+    category = guild.get_channel(guild_cfg["category"])
+    staff_role = guild.get_role(guild_cfg["staff_role"])
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -651,13 +711,15 @@ async def on_member_join(member):
             view_channel=True,
             send_messages=True,
             read_message_history=True
-        ),
+        ) if staff_role else None,
 
         guild.me: discord.PermissionOverwrite(
             view_channel=True,
             read_message_history=True
         )
     }
+    # Remove None keys
+    overwrites = {k: v for k, v in overwrites.items() if v is not None}
 
     channel = await guild.create_text_channel(
         f"verify-{member.name}",
@@ -685,7 +747,7 @@ async def on_member_join(member):
         "Please answer in this channel."
     )
 
-    daily_stats["joins"].append(discord.utils.utcnow().hour)
+    stats["joins"].append(discord.utils.utcnow().hour)
 
     await log_action(
         guild,
@@ -699,7 +761,6 @@ async def on_member_join(member):
         ]
     )
 
-    # Start auto-kick timer
     asyncio.create_task(auto_kick_if_unverified(member.id, guild.id, delay=600))
 
 # =========================
@@ -751,16 +812,17 @@ async def on_message(message):
     if not guild:
         return await bot.process_commands(message)
 
+    guild_cfg = get_guild_config(guild.id)
     channel = message.channel
 
-    if channel.category and channel.category.id == config.get("category") and channel.topic:
+    if channel.category and guild_cfg.get("category") and channel.category.id == guild_cfg["category"] and channel.topic:
         if channel.topic.startswith("ticket_for:"):
             try:
                 user_id = int(channel.topic.split("ticket_for:")[1].split("|")[0])
             except:
                 user_id = None
 
-            staff_role = guild.get_role(config.get("staff_role"))
+            staff_role = guild.get_role(guild_cfg.get("staff_role")) if guild_cfg.get("staff_role") else None
             is_staff = (
                 message.author.guild_permissions.administrator or
                 (staff_role and staff_role in message.author.roles)
@@ -833,6 +895,7 @@ async def staff_inactivity_check():
     await bot.wait_until_ready()
     while not bot.is_closed():
         for guild in bot.guilds:
+            guild_cfg = get_guild_config(guild.id)
             for channel in guild.text_channels:
                 if channel.topic and "claimed_by:" in channel.topic:
                     last_msg = None
@@ -855,7 +918,7 @@ async def staff_inactivity_check():
         await asyncio.sleep(60)
 
 # =========================
-# DAILY SUMMARY
+# DAILY SUMMARY (PER GUILD)
 # =========================
 async def daily_summary():
     await bot.wait_until_ready()
@@ -863,8 +926,10 @@ async def daily_summary():
         now = discord.utils.utcnow()
         if now.hour == 23 and now.minute == 59:
             for guild in bot.guilds:
-                if daily_stats["joins"]:
-                    peak_hour = max(set(daily_stats["joins"]), key=daily_stats["joins"].count)
+                stats = get_daily_stats(guild.id)
+
+                if stats["joins"]:
+                    peak_hour = max(set(stats["joins"]), key=stats["joins"].count)
                 else:
                     peak_hour = "N/A"
 
@@ -874,19 +939,19 @@ async def daily_summary():
                     "Here is the summary of today's verification activity:",
                     color=0x5865F2,
                     fields=[
-                        ("Approved", str(daily_stats["approved"]), True),
-                        ("Denied", str(daily_stats["denied"]), True),
-                        ("Blacklisted", str(daily_stats["blacklisted"]), True),
-                        ("Auto-Kicked", str(daily_stats["autokicked"]), True),
+                        ("Approved", str(stats["approved"]), True),
+                        ("Denied", str(stats["denied"]), True),
+                        ("Blacklisted", str(stats["blacklisted"]), True),
+                        ("Auto-Kicked", str(stats["autokicked"]), True),
                         ("Peak Join Hour", str(peak_hour), True)
                     ]
                 )
 
-            daily_stats["approved"] = 0
-            daily_stats["denied"] = 0
-            daily_stats["blacklisted"] = 0
-            daily_stats["autokicked"] = 0
-            daily_stats["joins"] = []
+                stats["approved"] = 0
+                stats["denied"] = 0
+                stats["blacklisted"] = 0
+                stats["autokicked"] = 0
+                stats["joins"] = []
 
         await asyncio.sleep(60)
 
@@ -928,8 +993,8 @@ class HelpMenu(discord.ui.View):
             color=0x5865F2
         )
         embed.add_field(name=".help", value="Shows this help menu.", inline=False)
-        embed.add_field(name=".requirements <gender> <text>", value="Set verification requirements.", inline=False)
-        embed.add_field(name=".unblacklist <user_id>", value="Remove a user from blacklist.", inline=False)
+        embed.add_field(name=".requirements <gender> <text>", value="Set verification requirements (shared).", inline=False)
+        embed.add_field(name=".unblacklist <user_id>", value="Remove a user from blacklist (this server).", inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -940,7 +1005,7 @@ class HelpMenu(discord.ui.View):
             description="Commands and controls for staff.",
             color=0x57F287
         )
-        embed.add_field(name=".setup", value="Initial server setup.", inline=False)
+        embed.add_field(name=".setup", value="Initial server setup (per server).", inline=False)
         embed.add_field(name="Approve Button", value="Approves a user.", inline=False)
         embed.add_field(name="Deny Button", value="Denies a user.", inline=False)
         embed.add_field(name="Blacklist Button", value="Blacklists a user.", inline=False)
@@ -971,7 +1036,7 @@ class HelpMenu(discord.ui.View):
             description="Verification & moderation bot with logging, tickets, and staff tools.",
             color=0xED4245
         )
-        embed.add_field(name="Developer", value="Fuad", inline=False)
+        embed.add_field(name="Developer", value="label", inline=False)
         embed.add_field(name="Features", value="Verification • Tickets • Logging • Staff Tools", inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1008,7 +1073,7 @@ async def on_ready():
     bot.loop.create_task(daily_summary())
 
     print(f"Logged in as {bot.user}")
-    print(f"Config: {config}")
+    print(f"Loaded config: {config}")
 
 # =========================
 bot.run(os.getenv("TOKEN"))
