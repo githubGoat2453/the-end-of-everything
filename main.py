@@ -86,6 +86,72 @@ async def init_db():
         )
         """)
 
+        # ===== Forensic / AI Judge Tables =====
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS forensic_scores (
+            guild_id INTEGER,
+            user_id INTEGER,
+            suspicion INTEGER DEFAULT 0,
+            tone TEXT DEFAULT '😐 Neutral',
+            difficulty INTEGER DEFAULT 0,
+            cooperation INTEGER DEFAULT 100,
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS forensic_timeline (
+            guild_id INTEGER,
+            user_id INTEGER,
+            event TEXT,
+            timestamp REAL
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS forensic_patterns (
+            guild_id INTEGER,
+            user_id INTEGER,
+            pattern TEXT
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS forensic_staff (
+            guild_id INTEGER,
+            staff_id INTEGER,
+            tickets_claimed INTEGER DEFAULT 0,
+            avg_response REAL DEFAULT 0,
+            escalations INTEGER DEFAULT 0,
+            notes INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, staff_id)
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS forensic_heatmap (
+            guild_id INTEGER,
+            hour INTEGER,
+            joins INTEGER DEFAULT 0,
+            tickets INTEGER DEFAULT 0,
+            approvals INTEGER DEFAULT 0,
+            denials INTEGER DEFAULT 0,
+            blacklists INTEGER DEFAULT 0,
+            staff_responses INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, hour)
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS ai_judge_overrides (
+            guild_id INTEGER,
+            user_id INTEGER,
+            ai_verdict TEXT,
+            staff_verdict TEXT,
+            risk INTEGER
+        )
+        """)
+
         await db.commit()
 
 # =========================
@@ -181,6 +247,362 @@ async def log_action(guild, title, description, color=0x2b2d31, *, fields=None):
         await channel.send(embed=embed)
     except Exception as e:
         print(f"Failed to log action: {e}")
+
+# =========================
+# FORENSIC HELPERS (MODULES)
+# =========================
+
+async def add_timeline_event(guild_id: int, user_id: int, event: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT INTO forensic_timeline (guild_id, user_id, event, timestamp) VALUES (?, ?, ?, ?)",
+            (guild_id, user_id, event, time.time())
+        )
+        await db.commit()
+
+async def add_suspicion(guild_id: int, user_id: int, amount: int, reason: str, guild: discord.Guild | None = None):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT suspicion FROM forensic_scores WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+        current = row[0] if row else 0
+        new_score = max(0, min(current + amount, 100))
+        await db.execute(
+            "INSERT OR REPLACE INTO forensic_scores (guild_id, user_id, suspicion) VALUES (?, ?, ?)",
+            (guild_id, user_id, new_score)
+        )
+        await db.commit()
+
+    if guild and abs(new_score - current) >= 25:
+        await log_action(
+            guild,
+            "⚠️ Risk Spike Detected",
+            f"User: <@{user_id}>\nSuspicion jumped from {current} → {new_score}\nReason: {reason}",
+            color=0xFF0000,
+            fields=[
+                ("Old Suspicion", str(current), True),
+                ("New Suspicion", str(new_score), True),
+                ("Reason", reason, False)
+            ]
+        )
+
+def analyze_tone(text: str):
+    t = text.lower()
+    if any(w in t for w in ["uh", "um", "idk", "i dont know", "..."]):
+        return "😬 Nervous / Hesitant", 1
+    if any(w in t for w in ["wtf", "bro", "tf", "mad", "angry", "annoyed"]):
+        return "😡 Angry / Irritated", 2
+    if t == t.strip().lower() and len(text.split()) > 4:
+        return "🤖 Robotic / Scripted", 3
+    if any(w in t for w in ["greetings", "dear", "sincerely", "regards"]):
+        return "🧊 Overly Formal / Cold", 2
+    if any(w in t for w in ["lol", "lmao", "haha", "😂"]):
+        return "😁 Friendly / Casual", 1
+    if "?" in text and len(text) < 20:
+        return "🥴 Confused", 1
+    if any(w in t for w in ["im sad", "im upset", "crying", "hurt"]):
+        return "😭 Emotional Distress", 3
+    return "😐 Neutral", 0
+
+emoji_traits = {
+    "😂": "Friendly",
+    "😭": "Emotional",
+    "😡": "Aggressive",
+    "🤖": "Robotic",
+    "💀": "Chaotic",
+    "😶": "Nervous"
+}
+
+def calculate_confidence(text: str) -> int:
+    score = 50
+    if len(text) < 5:
+        score -= 20
+    if "?" in text:
+        score -= 10
+    if "..." in text:
+        score -= 15
+    if len(text) > 40:
+        score += 10
+    return max(0, min(score, 100))
+
+def estimate_truthfulness(text: str) -> int:
+    t = text.lower()
+    score = 80
+    if "i swear" in t:
+        score -= 20
+    if "trust me" in t:
+        score -= 15
+    if "honestly" in t:
+        score -= 10
+    if "edited" in t:
+        score -= 25
+    return max(0, min(score, 100))
+
+async def log_tone(guild: discord.Guild, user_id: int, tone: str, severity: int, message: str):
+    await log_action(
+        guild,
+        f"🎭 Tone Analysis — {tone}",
+        f"User: <@{user_id}>\nTone Severity: **{severity}**\n\nMessage:\n{message}",
+        color=0xCC33FF
+    )
+
+async def analyze_emoji_profile(guild: discord.Guild, user_id: int, text: str):
+    used = [e for e in emoji_traits if e in text]
+    if not used:
+        return
+    traits = ", ".join([emoji_traits[e] for e in used])
+    await log_action(
+        guild,
+        "🎭 Emoji Personality Profile",
+        f"User: <@{user_id}>\nTraits: **{traits}**",
+        color=0xFF99FF
+    )
+
+async def log_emotional_curve(guild: discord.Guild, member: discord.Member, new_tone: str):
+    history = getattr(member, "tone_history", [])
+    history.append(new_tone)
+    member.tone_history = history
+    if len(history) >= 4:
+        curve = " → ".join(history[-4:])
+        await log_action(
+            guild,
+            "📉 Emotional Stability Curve",
+            f"User: {member.mention}\nCurve: {curve}",
+            color=0xFFAA33
+        )
+
+def calculate_momentum(member: discord.Member) -> int:
+    fast = getattr(member, "fast_responses", 0)
+    hes = getattr(member, "hesitations", 0)
+    score = 50 + fast * 10 - hes * 10
+    return max(0, min(score, 100))
+
+def cooperation_score(edits: int, deletes: int, bypasses: int) -> int:
+    score = 100 - edits * 10 - deletes * 15 - bypasses * 20
+    return max(0, score)
+
+def volatility(history: list[str]) -> int:
+    if len(history) < 2:
+        return 0
+    changes = sum(1 for i in range(1, len(history)) if history[i] != history[i - 1])
+    return min(100, changes * 20)
+
+def predictability(history: list[str]) -> int:
+    if not history:
+        return 50
+    return max(0, 100 - len(set(history)) * 20)
+
+def classify_style(tone: str, patterns: list[str]) -> str:
+    if "Robotic" in tone:
+        return "🤖 Robotic"
+    if "Nervous" in tone:
+        return "😬 Nervous"
+    if "Angry" in tone:
+        return "😡 Aggressive"
+    if patterns:
+        return "🧩 Scripted"
+    return "😐 Neutral"
+
+def symmetry(user_len: int, staff_len: int) -> int:
+    if staff_len == 0:
+        return 50
+    ratio = user_len / staff_len
+    return int(100 - abs(1 - ratio) * 40)
+
+def cognitive_load(hesitations: int, tone_history: list[str]) -> int:
+    stress = sum(1 for t in tone_history if "Nervous" in t or "Distress" in t)
+    return min(100, hesitations * 10 + stress * 15)
+
+async def calculate_difficulty(guild_id: int, user_id: int) -> int:
+    suspicion = 0
+    tone = "Unknown"
+    patterns = 0
+    escalations = 0
+    proof_requests = 0
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT suspicion, tone, difficulty, cooperation FROM forensic_scores WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                suspicion, tone, difficulty, coop = row
+            else:
+                suspicion, tone, difficulty, coop = 0, "Unknown", 0, 100
+
+        async with db.execute(
+            "SELECT COUNT(*) FROM forensic_patterns WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ) as cursor:
+            patterns = (await cursor.fetchone())[0]
+
+        async with db.execute(
+            "SELECT COUNT(*) FROM forensic_timeline WHERE guild_id=? AND user_id=? AND event LIKE '🚨%'",
+            (guild_id, user_id)
+        ) as cursor:
+            escalations = (await cursor.fetchone())[0]
+
+        async with db.execute(
+            "SELECT COUNT(*) FROM forensic_timeline WHERE guild_id=? AND user_id=? AND event LIKE '🔍%'",
+            (guild_id, user_id)
+        ) as cursor:
+            proof_requests = (await cursor.fetchone())[0]
+
+    difficulty_score = (
+        suspicion * 0.5 +
+        patterns * 5 +
+        escalations * 15 +
+        proof_requests * 10 +
+        (100 - coop) * 0.2
+    )
+
+    if "🤖 Robotic" in tone:
+        difficulty_score += 20
+    if "😭 Emotional Distress" in tone:
+        difficulty_score += 10
+    if "😡 Angry" in tone:
+        difficulty_score += 15
+
+    return min(int(difficulty_score), 100)
+
+def difficulty_label(score: int) -> str:
+    if score < 20:
+        return "🟢 EASY"
+    if score < 40:
+        return "🟡 MEDIUM"
+    if score < 70:
+        return "🔥 HARD"
+    if score < 90:
+        return "🚨 SUSPICIOUS"
+    return "💀 IMPOSSIBLE"
+
+async def build_final_verdict(guild: discord.Guild, user_id: int, verdict_label: str):
+    suspicion = 0
+    difficulty = 0
+    tone = "Unknown"
+    patterns = []
+    timeline = []
+    integrity_flags = []
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT suspicion, tone, difficulty, cooperation FROM forensic_scores WHERE guild_id=? AND user_id=?",
+            (guild.id, user_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                suspicion, tone, difficulty, coop = row
+            else:
+                suspicion, tone, difficulty, coop = 0, "Unknown", 0, 100
+
+        async with db.execute(
+            "SELECT pattern FROM forensic_patterns WHERE guild_id=? AND user_id=?",
+            (guild.id, user_id)
+        ) as cursor:
+            patterns = [r[0] for r in await cursor.fetchall()]
+
+        async with db.execute(
+            "SELECT event, timestamp FROM forensic_timeline WHERE guild_id=? AND user_id=? ORDER BY timestamp ASC",
+            (guild.id, user_id)
+        ) as cursor:
+            timeline = await cursor.fetchall()
+
+        async with db.execute(
+            "SELECT event FROM forensic_timeline WHERE guild_id=? AND user_id=? AND (event LIKE '🚨%' OR event LIKE '🧨%')",
+            (guild.id, user_id)
+        ) as cursor:
+            integrity_flags = [r[0] for r in await cursor.fetchall()]
+
+    timeline_text = ""
+    for event, ts in timeline:
+        t = time.strftime("%H:%M:%S", time.localtime(ts))
+        timeline_text += f"{t} — {event}\n"
+
+    patterns_text = "\n".join([f"• {p}" for p in patterns]) if patterns else "None"
+    integrity_text = "\n".join([f"• {i}" for i in integrity_flags]) if integrity_flags else "None"
+
+    return {
+        "suspicion": suspicion,
+        "difficulty": difficulty,
+        "tone": tone,
+        "patterns": patterns_text,
+        "timeline": timeline_text,
+        "integrity": integrity_text,
+        "verdict": verdict_label
+    }
+
+async def log_final_verdict(guild: discord.Guild, user_id: int, verdict_label: str):
+    data = await build_final_verdict(guild, user_id, verdict_label)
+    await log_action(
+        guild,
+        f"📁 Final Forensic Verdict — {verdict_label}",
+        (
+            f"User: <@{user_id}>\n\n"
+            f"🔥 Suspicion Score: {data['suspicion']}/100\n"
+            f"🧬 Difficulty Score: {data['difficulty']}/100\n"
+            f"🎭 Tone: {data['tone']}\n\n"
+            f"🧩 Behavior Patterns:\n{data['patterns']}\n\n"
+            f"🧱 Integrity Flags:\n{data['integrity']}\n\n"
+            f"⏳ Timeline:\n{data['timeline']}\n\n"
+            f"📌 Final Verdict: {data['verdict']}"
+        ),
+        color=0xFF00FF
+    )
+
+async def ai_judge_decide(guild_id: int, user_id: int):
+    suspicion = 0
+    difficulty = 0
+    integrity_flags = 0
+    cooperation = 100
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT suspicion, difficulty, cooperation FROM forensic_scores WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                suspicion, difficulty, cooperation = row
+
+        async with db.execute(
+            "SELECT COUNT(*) FROM forensic_timeline WHERE guild_id=? AND user_id=? AND (event LIKE '🚨%' OR event LIKE '🧨%')",
+            (guild_id, user_id)
+        ) as cursor:
+            integrity_flags = (await cursor.fetchone())[0]
+
+    risk = (
+        suspicion * 0.4 +
+        difficulty * 0.25 +
+        integrity_flags * 10 +
+        (100 - cooperation) * 0.2
+    )
+    risk = max(0, min(int(risk), 100))
+
+    if risk < 20:
+        verdict = "approve"
+        label = "🟢 APPROVE"
+    elif risk < 50:
+        verdict = "review"
+        label = "🟡 NEEDS REVIEW"
+    elif risk < 75:
+        verdict = "deny"
+        label = "❌ DENY"
+    else:
+        verdict = "blacklist"
+        label = "🧨 BLACKLIST"
+
+    return risk, verdict, label
+
+async def log_ai_override(guild_id: int, user_id: int, ai_verdict: str, staff_verdict: str, risk: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT INTO ai_judge_overrides (guild_id, user_id, ai_verdict, staff_verdict, risk) VALUES (?, ?, ?, ?, ?)",
+            (guild_id, user_id, ai_verdict, staff_verdict, risk)
+        )
+        await db.commit()
 
 # =========================
 # SETUP COMMAND (PER GUILD)
@@ -407,6 +829,8 @@ class TicketControls(discord.ui.View):
 
         stats["approved"] += 1
 
+        # AI Judge shadow verdict
+        risk, ai_verdict, ai_label = await ai_judge_decide(interaction.guild.id, member.id)
         await log_action(
             interaction.guild,
             "🟢 Approved",
@@ -417,9 +841,16 @@ class TicketControls(discord.ui.View):
                 ("User", member.mention, True),
                 ("User ID", str(member.id), True),
                 ("Gender", self.gender.capitalize(), True),
-                ("Channel", interaction.channel.mention, True)
+                ("Channel", interaction.channel.mention, True),
+                ("AI Judge Verdict", ai_label, True),
+                ("Risk Score", str(risk), True)
             ]
         )
+
+        if ai_verdict != "approve":
+            await log_ai_override(interaction.guild.id, member.id, ai_verdict, "approve", risk)
+
+        await log_final_verdict(interaction.guild, member.id, "🟢 APPROVED")
 
         await interaction.response.send_message("Approved")
         await interaction.channel.delete()
@@ -443,6 +874,8 @@ class TicketControls(discord.ui.View):
 
         stats["denied"] += 1
 
+        risk, ai_verdict, ai_label = await ai_judge_decide(interaction.guild.id, member.id)
+
         await log_action(
             interaction.guild,
             "🔴 Denied",
@@ -453,9 +886,16 @@ class TicketControls(discord.ui.View):
                 ("User", member.mention, True),
                 ("User ID", str(member.id), True),
                 ("Gender", self.gender.capitalize(), True),
-                ("Channel", interaction.channel.mention, True)
+                ("Channel", interaction.channel.mention, True),
+                ("AI Judge Verdict", ai_label, True),
+                ("Risk Score", str(risk), True)
             ]
         )
+
+        if ai_verdict != "deny":
+            await log_ai_override(interaction.guild.id, member.id, ai_verdict, "deny", risk)
+
+        await log_final_verdict(interaction.guild, member.id, "❌ DENIED")
 
         await interaction.response.send_message("Denied")
         await interaction.channel.delete()
@@ -481,6 +921,8 @@ class TicketControls(discord.ui.View):
 
         stats["blacklisted"] += 1
 
+        risk, ai_verdict, ai_label = await ai_judge_decide(interaction.guild.id, member.id)
+
         await log_action(
             interaction.guild,
             "⚫ Blacklisted",
@@ -490,9 +932,16 @@ class TicketControls(discord.ui.View):
                 ("Staff", interaction.user.mention, True),
                 ("User", member.mention, True),
                 ("User ID", str(member.id), True),
-                ("Channel", interaction.channel.mention, True)
+                ("Channel", interaction.channel.mention, True),
+                ("AI Judge Verdict", ai_label, True),
+                ("Risk Score", str(risk), True)
             ]
         )
+
+        if ai_verdict != "blacklist":
+            await log_ai_override(interaction.guild.id, member.id, ai_verdict, "blacklist", risk)
+
+        await log_final_verdict(interaction.guild, member.id, "🧨 BLACKLISTED")
 
         await interaction.response.send_message("Blacklisted")
         await interaction.channel.delete()
@@ -540,6 +989,8 @@ class TicketControls(discord.ui.View):
         except:
             pass
 
+        await add_timeline_event(interaction.guild.id, member.id, "🔍 Proof requested by staff")
+
         await log_action(
             interaction.guild,
             "🟡 Proof Requested",
@@ -560,6 +1011,8 @@ class TicketControls(discord.ui.View):
             return await interaction.response.send_message("Staff only", ephemeral=True)
 
         member = interaction.guild.get_member(self.user_id)
+
+        await add_timeline_event(interaction.guild.id, member.id, "🚨 Ticket escalated by staff")
 
         await log_action(
             interaction.guild,
@@ -599,6 +1052,8 @@ async def auto_kick_if_unverified(member_id, guild_id, delay=600):
         await member.kick(reason="Verification timeout")
 
         stats["autokicked"] += 1
+
+        await add_timeline_event(guild.id, member.id, "🧨 Auto-kicked for verification timeout")
 
         await log_action(
             guild,
@@ -749,6 +1204,8 @@ async def on_member_join(member):
 
     stats["joins"].append(discord.utils.utcnow().hour)
 
+    await add_timeline_event(guild.id, member.id, "🎫 Ticket created on join")
+
     await log_action(
         guild,
         "👤 Member Joined",
@@ -777,6 +1234,8 @@ async def on_member_remove(member):
             break
 
     if ticket_channel:
+        await add_timeline_event(guild.id, member.id, "🚪 User left during verification")
+
         await log_action(
             guild,
             "🚪 User Left During Verification",
@@ -801,7 +1260,7 @@ async def on_member_remove(member):
         )
 
 # =========================
-# STAFF CLAIM / ALIAS / STAFF ACTIVITY
+# STAFF CLAIM / ALIAS / STAFF ACTIVITY + FORENSICS
 # =========================
 @bot.event
 async def on_message(message):
@@ -815,6 +1274,7 @@ async def on_message(message):
     guild_cfg = get_guild_config(guild.id)
     channel = message.channel
 
+    # Ticket channel logic
     if channel.category and guild_cfg.get("category") and channel.category.id == guild_cfg["category"] and channel.topic:
         if channel.topic.startswith("ticket_for:"):
             try:
@@ -837,6 +1297,8 @@ async def on_message(message):
                     topic=new_topic
                 )
 
+                await add_timeline_event(guild.id, user_id, f"🛡️ Ticket claimed by {message.author.id}")
+
                 await log_action(
                     guild,
                     "🛡️ Ticket Claimed",
@@ -857,6 +1319,8 @@ async def on_message(message):
                     claimed_id = None
 
                 if claimed_id and claimed_id != message.author.id:
+                    await add_timeline_event(guild.id, user_id, f"⚠️ Staff takeover attempt by {message.author.id}")
+
                     await log_action(
                         guild,
                         "⚠️ Staff Takeover Attempt",
@@ -873,6 +1337,8 @@ async def on_message(message):
             if user_id and message.author.id == user_id and "alias_logged" not in channel.topic:
                 await channel.edit(topic=channel.topic + "|alias_logged")
 
+                await add_timeline_event(guild.id, user_id, "📝 Alias answered")
+
                 await log_action(
                     guild,
                     "📝 Alias Answered",
@@ -885,6 +1351,35 @@ async def on_message(message):
                         ("Alias", message.content[:200], False)
                     ]
                 )
+
+            # FORENSIC: tone, emoji, confidence, truth, emotional curve
+            if user_id and message.author.id == user_id:
+                tone, severity = analyze_tone(message.content)
+                await log_tone(guild, user_id, tone, severity, message.content)
+                await analyze_emoji_profile(guild, user_id, message.content)
+
+                conf = calculate_confidence(message.content)
+                truth = estimate_truthfulness(message.content)
+
+                await log_action(
+                    guild,
+                    "💬 Confidence & Truthfulness",
+                    f"User: <@{user_id}>\nConfidence: **{conf}%**\nTruthfulness Estimate: **{truth}%**",
+                    color=0x33FFAA
+                )
+
+                member = guild.get_member(user_id)
+                if member:
+                    await log_emotional_curve(guild, member, tone)
+
+                async with aiosqlite.connect(DB_NAME) as db:
+                    await db.execute(
+                        "INSERT OR REPLACE INTO forensic_scores (guild_id, user_id, tone) VALUES (?, ?, ?)",
+                        (guild.id, user_id, tone)
+                    )
+                    await db.commit()
+
+                await add_timeline_event(guild.id, user_id, f"💬 User message: {message.content[:100]}")
 
     await bot.process_commands(message)
 
@@ -1033,11 +1528,11 @@ class HelpMenu(discord.ui.View):
     async def about(self, interaction, button):
         embed = discord.Embed(
             title="ℹ️ About This Bot",
-            description="Verification & moderation bot with logging, tickets, and staff tools.",
+            description="Verification & moderation bot with logging, tickets, staff tools, and forensic intelligence.",
             color=0xED4245
         )
         embed.add_field(name="Developer", value="label", inline=False)
-        embed.add_field(name="Features", value="Verification • Tickets • Logging • Staff Tools", inline=False)
+        embed.add_field(name="Features", value="Verification • Tickets • Logging • Staff Tools • Forensic AI Judge", inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
