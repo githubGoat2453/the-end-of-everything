@@ -4,7 +4,6 @@ import os
 import aiosqlite
 import asyncio
 import time
-from urllib.parse import urlparse
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=".", intents=intents)
@@ -12,19 +11,14 @@ bot.remove_command("help")
 
 DB_NAME = "bot.db"
 
-# In-memory rejoin cooldowns: {user_id: unix_timestamp_until_allowed}
-cooldowns = {}
+# In-memory cooldowns and stats
+cooldowns = {}  # {user_id: unix_timestamp_until_allowed}
+daily_stats = {}  # {guild_id: {...}}
+message_flood = {}  # {channel_id: {user_id: [timestamps]}}
 
-# Per-guild daily stats: {guild_id: {...}}
-daily_stats = {}
+# Per-guild config
+config = {}  # {guild_id: {...}}
 
-# Simple flood tracking: {channel_id: {user_id: [timestamps]}}
-message_flood = {}
-
-# =========================
-# CONFIG (PER GUILD)
-# =========================
-config = {}
 
 def get_guild_config(guild_id: int):
     if guild_id not in config:
@@ -38,6 +32,7 @@ def get_guild_config(guild_id: int):
         }
     return config[guild_id]
 
+
 def get_daily_stats(guild_id: int):
     if guild_id not in daily_stats:
         daily_stats[guild_id] = {
@@ -49,14 +44,12 @@ def get_daily_stats(guild_id: int):
         }
     return daily_stats[guild_id]
 
+
 # =========================
 # DATABASE INIT
 # =========================
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DROP TABLE IF EXISTS blacklist")
-        await db.execute("DROP TABLE IF EXISTS config")
-
         await db.execute("""
         CREATE TABLE IF NOT EXISTS blacklist (
             guild_id INTEGER,
@@ -83,6 +76,7 @@ async def init_db():
 
         await db.commit()
 
+
 # =========================
 # DB HELPERS
 # =========================
@@ -94,6 +88,7 @@ async def add_blacklist(guild_id, user_id):
         )
         await db.commit()
 
+
 async def remove_blacklist(guild_id, user_id):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -102,6 +97,7 @@ async def remove_blacklist(guild_id, user_id):
         )
         await db.commit()
 
+
 async def is_blacklisted(guild_id, user_id):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
@@ -109,6 +105,7 @@ async def is_blacklisted(guild_id, user_id):
             (guild_id, user_id)
         ) as cursor:
             return await cursor.fetchone() is not None
+
 
 async def save_config_for_guild(guild_id):
     guild_cfg = get_guild_config(guild_id)
@@ -121,6 +118,7 @@ async def save_config_for_guild(guild_id):
                 )
         await db.commit()
 
+
 async def load_config():
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT guild_id, key, value FROM config") as cursor:
@@ -130,6 +128,7 @@ async def load_config():
                 if key in guild_cfg:
                     guild_cfg[key] = value
 
+
 async def set_requirement(gender, text):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -137,6 +136,7 @@ async def set_requirement(gender, text):
             (gender, text)
         )
         await db.commit()
+
 
 async def get_requirement(gender):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -146,6 +146,7 @@ async def get_requirement(gender):
         ) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else "Not set"
+
 
 # =========================
 # LOGGING
@@ -176,6 +177,7 @@ async def log_action(guild, title, description, color=0x2b2d31, *, fields=None):
         await channel.send(embed=embed)
     except Exception as e:
         print(f"Failed to log action: {e}")
+
 
 # =========================
 # SETUP COMMAND
@@ -240,8 +242,9 @@ async def setup(ctx):
         color=0x57F287
     )
 
+
 # =========================
-# REQUIREMENTS
+# REQUIREMENTS COMMAND
 # =========================
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -260,6 +263,7 @@ async def requirements(ctx, gender, *, text):
             ("Updated By", ctx.author.mention, True)
         ]
     )
+
 
 # =========================
 # UNBLACKLIST
@@ -281,8 +285,9 @@ async def unblacklist(ctx, user_id: int):
         ]
     )
 
+
 # =========================
-# GENDER UI
+# GENDER BUTTONS
 # =========================
 class GenderButtons(discord.ui.View):
     def __init__(self, user_id):
@@ -325,17 +330,14 @@ class GenderButtons(discord.ui.View):
         )
 
         next_steps_embed = discord.Embed(
-            title="Wait — we're not done yet!",
+            title="Next Steps",
             description=(
-                "**Verification Requirement**\n"
-                "• Answer the questions in this ticket so staff can review you.\n\n"
-                "**Important Notice**\n"
-                "The buttons below are restricted and can only be used by authorized administrators."
+                "Please answer the questions in this ticket so staff can review you.\n\n"
+                "**Note:** Some questions may differ slightly based on the gender you selected, "
+                "but all verification is handled by staff and remains non-judgmental."
             ),
             color=0x2b2d31
         )
-
-        next_steps_embed.set_author(name="NEXT STEPS")
 
         await interaction.channel.send(embed=next_steps_embed)
 
@@ -343,6 +345,7 @@ class GenderButtons(discord.ui.View):
             "🎫 Staff Controls:",
             view=TicketControls(self.user_id, gender)
         )
+
 
 # =========================
 # TICKET CONTROLS
@@ -393,6 +396,8 @@ class TicketControls(discord.ui.View):
         stats = get_daily_stats(interaction.guild.id)
 
         member = interaction.guild.get_member(self.user_id)
+        if not member:
+            return await interaction.response.send_message("User not found.", ephemeral=True)
 
         male = interaction.guild.get_role(guild_cfg["male_role"])
         female = interaction.guild.get_role(guild_cfg["female_role"])
@@ -432,6 +437,8 @@ class TicketControls(discord.ui.View):
         stats = get_daily_stats(interaction.guild.id)
 
         member = interaction.guild.get_member(self.user_id)
+        if not member:
+            return await interaction.response.send_message("User not found.", ephemeral=True)
 
         try:
             await member.send("❌ Your verification was denied.")
@@ -462,6 +469,8 @@ class TicketControls(discord.ui.View):
         stats = get_daily_stats(interaction.guild.id)
 
         member = interaction.guild.get_member(self.user_id)
+        if not member:
+            return await interaction.response.send_message("User not found.", ephemeral=True)
 
         await add_blacklist(interaction.guild.id, member.id)
 
@@ -501,6 +510,8 @@ class TicketControls(discord.ui.View):
             return
 
         member = interaction.guild.get_member(self.user_id)
+        if not member:
+            return
 
         await log_action(
             interaction.guild,
@@ -521,9 +532,13 @@ class TicketControls(discord.ui.View):
             return await interaction.response.send_message("Staff only", ephemeral=True)
 
         member = interaction.guild.get_member(self.user_id)
+        if not member:
+            return await interaction.response.send_message("User not found.", ephemeral=True)
+
         try:
             await member.send(
-                "📎 Please provide any required proof or screenshots by replying here or uploading them in your ticket channel."
+                "📎 Staff has requested additional proof or context for your verification. "
+                "You can provide screenshots or extra details in your ticket channel."
             )
         except:
             pass
@@ -552,12 +567,12 @@ class TicketControls(discord.ui.View):
         await log_action(
             interaction.guild,
             "🚨 Ticket Escalated",
-            f"{interaction.user.mention} escalated the ticket for {member.mention}.",
+            f"{interaction.user.mention} escalated the ticket for {member.mention if member else 'Unknown User'}.",
             color=0xED4245,
             fields=[
                 ("Staff", interaction.user.mention, True),
-                ("User", member.mention, True),
-                ("User ID", str(member.id), True),
+                ("User", member.mention if member else "Unknown", True),
+                ("User ID", str(self.user_id), True),
                 ("Channel", interaction.channel.mention, True)
             ]
         )
@@ -577,11 +592,18 @@ class TicketControls(discord.ui.View):
 
         channel = interaction.channel
 
-        questions = [
-            "1️⃣ What is your alias?",
-            "2️⃣ Who invited you to this server?",
-            "3️⃣ Anything else you’d like staff to know? (optional, you can say `skip`)"
-        ]
+        # Gender-specific SAFE questions
+        if self.gender == "female":
+            questions = [
+                "1️⃣ Who invited you to this server?",
+                "2️⃣ Send a Short Voice message to prove you are a female "
+            
+            ]
+        else:  # male
+            questions = [
+                "PoF $1000.00 Usd OR ",
+                "Invite 3 girls to be verified in the server"
+            ]
 
         answers = []
         response_times = []
@@ -620,21 +642,29 @@ class TicketControls(discord.ui.View):
                 answers.append(content[:500])
                 lengths.append(len(content))
 
-        alias = answers[0] if len(answers) > 0 else "N/A"
-        invited_by = answers[1] if len(answers) > 1 else "N/A"
-        extra = answers[2] if len(answers) > 2 else "N/A"
+        q1 = answers[0] if len(answers) > 0 else "N/A"
+        q2 = answers[1] if len(answers) > 1 else "N/A"
+        q3 = answers[2] if len(answers) > 2 else "N/A"
 
         end_time = discord.utils.utcnow()
         total_duration = (end_time - start_time).total_seconds()
 
         summary_embed = discord.Embed(
             title="📄 Automated Verification Summary",
-            description=f"User: {member.mention}",
+            description=f"User: {member.mention}\nGender: **{self.gender.capitalize()}**",
             color=0x2b2d31
         )
-        summary_embed.add_field(name="Alias", value=alias, inline=False)
-        summary_embed.add_field(name="Invited By", value=invited_by, inline=False)
-        summary_embed.add_field(name="Extra Info", value=extra, inline=False)
+        summary_embed.add_field(name="Q1: Who invited you?", value=q1, inline=False)
+        summary_embed.add_field(
+            name="Q2: Extra verification (optional)",
+            value=q2,
+            inline=False
+        )
+        summary_embed.add_field(
+            name="Q3: Anything else?",
+            value=q3,
+            inline=False
+        )
         summary_embed.add_field(
             name="Response Times",
             value="\n".join(
@@ -663,15 +693,17 @@ class TicketControls(discord.ui.View):
             fields=[
                 ("User", member.mention, True),
                 ("User ID", str(member.id), True),
-                ("Alias", alias[:100], False),
-                ("Invited By", invited_by[:100], False),
-                ("Extra Info", extra[:200], False),
+                ("Gender", self.gender.capitalize(), True),
+                ("Q1", q1[:150], False),
+                ("Q2", q2[:150], False),
+                ("Q3", q3[:150], False),
                 ("Total Duration", f"{total_duration:.1f}s", True),
                 ("Q1 Time", response_times[0] if len(response_times) > 0 else "N/A", True),
                 ("Q2 Time", response_times[1] if len(response_times) > 1 else "N/A", True),
                 ("Q3 Time", response_times[2] if len(response_times) > 2 else "N/A", True)
             ]
         )
+
 
 # =========================
 # AUTO-KICK TASK
@@ -710,8 +742,9 @@ async def auto_kick_if_unverified(member_id, guild_id, delay=600):
             ]
         )
 
+
 # =========================
-# MEMBER JOIN / CONFIG
+# CONFIG ENSURE
 # =========================
 async def ensure_config(guild):
     guild_cfg = get_guild_config(guild.id)
@@ -742,6 +775,10 @@ async def ensure_config(guild):
                 color=0xFEE75C
             )
 
+
+# =========================
+# MEMBER JOIN
+# =========================
 @bot.event
 async def on_member_join(member):
     guild = member.guild
@@ -826,9 +863,9 @@ async def on_member_join(member):
         description=(
             "Welcome to the server. Before accessing the main sections, you must complete our screening verification.\n\n"
             "**Step 1:** Select your gender below.\n"
-            "**Step 2:** Tell us how you were invited.\n"
-            "**Step 3:** Wait for our higher-ups to review your screening.\n\n"
-            "⚠️ Verification must be completed in 10 minutes or you will be kicked from the server."
+            "**Step 2:** Answer the questions in this ticket.\n"
+            "**Step 3:** Wait for staff to review your screening.\n\n"
+            "⚠️ Verification must be completed in 10 minutes or you may be removed from the server."
         ),
         color=0x2b2d31
     )
@@ -836,7 +873,7 @@ async def on_member_join(member):
     await channel.send(member.mention, embed=embed, view=GenderButtons(member.id))
 
     await channel.send(
-        "📝 **Question:** whats your alias?\n"
+        "📝 **Question:** What's your alias?\n"
         "Please answer in this channel."
     )
 
@@ -855,6 +892,7 @@ async def on_member_join(member):
     )
 
     asyncio.create_task(auto_kick_if_unverified(member.id, guild.id, delay=600))
+
 
 # =========================
 # MEMBER LEAVE
@@ -893,8 +931,9 @@ async def on_member_remove(member):
             ]
         )
 
+
 # =========================
-# MESSAGE EVENTS (CLAIM, ALIAS, FLOOD, LINKS, ATTACHMENTS, MENTIONS)
+# HELPER: IS TICKET CHANNEL
 # =========================
 def _is_ticket_channel(guild, channel):
     guild_cfg = get_guild_config(guild.id)
@@ -906,6 +945,10 @@ def _is_ticket_channel(guild, channel):
         and channel.topic.startswith("ticket_for:")
     )
 
+
+# =========================
+# MESSAGE EVENTS
+# =========================
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -999,6 +1042,7 @@ async def on_message(message):
             (staff_role and staff_role in message.author.roles)
         )
 
+        # Staff claim
         if is_staff and "claimed_by:" not in channel.topic:
             new_topic = channel.topic + f"|claimed_by:{message.author.id}"
 
@@ -1019,6 +1063,7 @@ async def on_message(message):
                 ]
             )
 
+        # Staff takeover attempt
         if is_staff and "claimed_by:" in channel.topic:
             try:
                 claimed_id = int(channel.topic.split("claimed_by:")[1].split("|")[0])
@@ -1038,6 +1083,7 @@ async def on_message(message):
                     ]
                 )
 
+        # Alias logging
         if user_id and message.author.id == user_id and "alias_logged" not in channel.topic:
             await channel.edit(topic=channel.topic + "|alias_logged")
 
@@ -1055,6 +1101,7 @@ async def on_message(message):
             )
 
     await bot.process_commands(message)
+
 
 # =========================
 # MESSAGE EDIT / DELETE LOGS
@@ -1082,6 +1129,7 @@ async def on_message_edit(before, after):
         ]
     )
 
+
 @bot.event
 async def on_message_delete(message):
     if message.author.bot or not message.guild:
@@ -1102,6 +1150,7 @@ async def on_message_delete(message):
         ]
     )
 
+
 # =========================
 # STAFF INACTIVITY CHECK
 # =========================
@@ -1109,9 +1158,8 @@ async def staff_inactivity_check():
     await bot.wait_until_ready()
     while not bot.is_closed():
         for guild in bot.guilds:
-            guild_cfg = get_guild_config(guild.id)
             for channel in guild.text_channels:
-                if channel.topic and "claimed_by:" in channel.topic:
+                if channel.topic and "claimed_by:" in channel.topic and _is_ticket_channel(guild, channel):
                     last_msg = None
                     async for msg in channel.history(limit=1):
                         last_msg = msg
@@ -1130,6 +1178,7 @@ async def staff_inactivity_check():
                                 ]
                             )
         await asyncio.sleep(60)
+
 
 # =========================
 # DAILY SUMMARY
@@ -1169,6 +1218,7 @@ async def daily_summary():
 
         await asyncio.sleep(60)
 
+
 # =========================
 # BOT HEALTH EVENTS
 # =========================
@@ -1182,6 +1232,7 @@ async def on_resumed():
             color=0x57F287
         )
 
+
 @bot.event
 async def on_disconnect():
     for guild in bot.guilds:
@@ -1191,6 +1242,7 @@ async def on_disconnect():
             "The bot lost connection to Discord.",
             color=0xED4245
         )
+
 
 # =========================
 # HELP MENU
@@ -1251,10 +1303,10 @@ class HelpMenu(discord.ui.View):
             description="Verification & moderation bot with logging, tickets, and staff tools.",
             color=0xED4245
         )
-        embed.add_field(name="Developer", value="label", inline=False)
         embed.add_field(name="Features", value="Verification • Tickets • Logging • Staff Tools • Bot Automation", inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 @bot.command()
 async def help(ctx):
@@ -1266,6 +1318,7 @@ async def help(ctx):
     embed.set_footer(text="Verification Bot • Help System")
 
     await ctx.send(embed=embed, view=HelpMenu())
+
 
 # =========================
 # READY
@@ -1290,5 +1343,8 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     print(f"Loaded config: {config}")
 
+
+# =========================
+# RUN
 # =========================
 bot.run(os.getenv("TOKEN"))
