@@ -332,9 +332,7 @@ class GenderButtons(discord.ui.View):
         next_steps_embed = discord.Embed(
             title="Next Steps",
             description=(
-                "Please answer the questions in this ticket so staff can review you.\n\n"
-                "**Note:** Some questions may differ slightly based on the gender you selected, "
-                "but all verification is handled by staff and remains non-judgmental."
+                "If you try to click anything below it wont work, only staff members are allowed to click them."
             ),
             color=0x2b2d31
         )
