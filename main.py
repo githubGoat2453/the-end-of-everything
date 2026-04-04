@@ -916,6 +916,47 @@ class TicketControls(discord.ui.View):
         add_staff_stat(interaction.guild.id, interaction.user.id, "automation_runs", 1)
         await save_staff_stats(interaction.guild.id, interaction.user.id)
 
+async def start_timer(channel, member, duration=600):
+    end_time = time.time() + duration
+    warned = False  # prevents spam ping
+
+    embed = discord.Embed(
+        title="⏳ Verification Timer",
+        description="Time remaining: **10:00**",
+        color=0xED4245
+    )
+
+    msg = await channel.send(embed=embed)
+
+    while True:
+        try:
+            remaining = int(end_time - time.time())
+
+            if remaining <= 0:
+                embed.description = "⛔ Time is up!"
+                await msg.edit(embed=embed)
+                break
+
+            minutes = remaining // 60
+            seconds = remaining % 60
+
+            embed.description = f"Time remaining: **{minutes:02d}:{seconds:02d}**"
+
+            # ⚠️ 1 MINUTE WARNING
+            if remaining <= 60 and not warned:
+                warned = True
+                await channel.send(
+                    f"⚠️ {member.mention} you have **1 minute left** to complete verification!"
+                )
+
+            await msg.edit(embed=embed)
+            await asyncio.sleep(1)
+
+        except discord.NotFound:
+            break
+        except Exception:
+            break
+
 
 # =========================
 # AUTO-KICK TASK
@@ -1100,6 +1141,7 @@ async def on_member_join(member):
     )
 
     await channel.send(member.mention, embed=embed, view=GenderButtons(member.id))
+    bot.loop.create_task(start_timer(channel, member))
 
     await channel.send(
         "📝 **Question:** What's your alias?\n"
