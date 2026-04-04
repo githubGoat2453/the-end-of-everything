@@ -4,6 +4,7 @@ import os
 import aiosqlite
 import asyncio
 import time
+from collections import defaultdict
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=".", intents=intents)
@@ -18,6 +19,27 @@ message_flood = {}  # {channel_id: {user_id: [timestamps]}}
 
 # Per-guild config
 config = {}  # {guild_id: {...}}
+
+# In-memory staff activity cache (for quick leaderboard)
+staff_cache = defaultdict(lambda: {
+    "tickets_claimed": 0,
+    "tickets_closed": 0,
+    "approvals": 0,
+    "denials": 0,
+    "blacklists": 0,
+    "escalations": 0,
+    "notes": 0,
+    "proof_requests": 0,
+    "automation_runs": 0,
+    "staff_messages": 0,
+    "followups": 0,
+    "total_response_time": 0.0,
+    "response_events": 0,
+    "active_time": 0.0,
+})
+
+# Per-ticket tracking for advanced logs
+ticket_tracking = {}  # {channel_id: {...}}
 
 
 def get_guild_config(guild_id: int):
@@ -71,6 +93,28 @@ async def init_db():
             key TEXT,
             value INTEGER,
             PRIMARY KEY (guild_id, key)
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS staff_stats (
+            guild_id INTEGER,
+            staff_id INTEGER,
+            tickets_claimed INTEGER DEFAULT 0,
+            tickets_closed INTEGER DEFAULT 0,
+            approvals INTEGER DEFAULT 0,
+            denials INTEGER DEFAULT 0,
+            blacklists INTEGER DEFAULT 0,
+            escalations INTEGER DEFAULT 0,
+            notes INTEGER DEFAULT 0,
+            proof_requests INTEGER DEFAULT 0,
+            automation_runs INTEGER DEFAULT 0,
+            staff_messages INTEGER DEFAULT 0,
+            followups INTEGER DEFAULT 0,
+            total_response_time REAL DEFAULT 0,
+            response_events INTEGER DEFAULT 0,
+            active_time REAL DEFAULT 0,
+            PRIMARY KEY (guild_id, staff_id)
         )
         """)
 
@@ -146,6 +190,86 @@ async def get_requirement(gender):
         ) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else "Not set"
+
+
+async def save_staff_stats(guild_id, staff_id):
+    data = staff_cache[(guild_id, staff_id)]
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+        INSERT OR REPLACE INTO staff_stats (
+            guild_id, staff_id,
+            tickets_claimed, tickets_closed,
+            approvals, denials, blacklists, escalations,
+            notes, proof_requests, automation_runs,
+            staff_messages, followups,
+            total_response_time, response_events, active_time
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            guild_id, staff_id,
+            data["tickets_claimed"],
+            data["tickets_closed"],
+            data["approvals"],
+            data["denials"],
+            data["blacklists"],
+            data["escalations"],
+            data["notes"],
+            data["proof_requests"],
+            data["automation_runs"],
+            data["staff_messages"],
+            data["followups"],
+            data["total_response_time"],
+            data["response_events"],
+            data["active_time"]
+        ))
+        await db.commit()
+
+
+async def load_staff_stats():
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+        SELECT guild_id, staff_id,
+               tickets_claimed, tickets_closed,
+               approvals, denials, blacklists, escalations,
+               notes, proof_requests, automation_runs,
+               staff_messages, followups,
+               total_response_time, response_events, active_time
+        FROM staff_stats
+        """) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                guild_id, staff_id = row[0], row[1]
+                staff_cache[(guild_id, staff_id)] = {
+                    "tickets_claimed": row[2],
+                    "tickets_closed": row[3],
+                    "approvals": row[4],
+                    "denials": row[5],
+                    "blacklists": row[6],
+                    "escalations": row[7],
+                    "notes": row[8],
+                    "proof_requests": row[9],
+                    "automation_runs": row[10],
+                    "staff_messages": row[11],
+                    "followups": row[12],
+                    "total_response_time": row[13],
+                    "response_events": row[14],
+                    "active_time": row[15],
+                }
+
+
+def add_staff_stat(guild_id, staff_id, key, amount=1):
+    data = staff_cache[(guild_id, staff_id)]
+    data[key] += amount
+
+
+def add_staff_response_time(guild_id, staff_id, seconds):
+    data = staff_cache[(guild_id, staff_id)]
+    data["total_response_time"] += seconds
+    data["response_events"] += 1
+
+
+def add_staff_active_time(guild_id, staff_id, seconds):
+    data = staff_cache[(guild_id, staff_id)]
+    data["active_time"] += seconds
 
 
 # =========================
@@ -329,10 +453,24 @@ class GenderButtons(discord.ui.View):
             ]
         )
 
+        # Interaction Map: gender button pressed
+        await log_action(
+            interaction.guild,
+            "🗺️ Interaction Map",
+            f"{interaction.user.mention} interacted with gender selection.",
+            color=0x2b2d31,
+            fields=[
+                ("User", interaction.user.mention, True),
+                ("Interaction", f"Pressed {gender.capitalize()} button", False)
+            ]
+        )
+
         next_steps_embed = discord.Embed(
             title="Next Steps",
             description=(
-                "If you try to click anything below it wont work, only staff members are allowed to click them."
+    
+                "Answer the questions From the requirements tab."
+                "The buttons below are staff only and you cannot click it."
             ),
             color=0x2b2d31
         )
@@ -377,6 +515,18 @@ class TicketControls(discord.ui.View):
         if extra_fields:
             fields.extend(extra_fields)
 
+        # Ticket Lifetime Log
+        await log_action(
+            interaction.guild,
+            "🏗️ Ticket Lifetime",
+            f"Ticket {channel.mention} lifetime recorded.",
+            color=0x2b2d31,
+            fields=[
+                ("Channel", channel.mention, True),
+                ("Duration", duration_str, True)
+            ]
+        )
+
         await log_action(
             interaction.guild,
             action_title,
@@ -384,6 +534,10 @@ class TicketControls(discord.ui.View):
             color=color,
             fields=fields
         )
+
+        # Staff stats: ticket closed
+        add_staff_stat(interaction.guild.id, interaction.user.id, "tickets_closed", 1)
+        await save_staff_stats(interaction.guild.id, interaction.user.id)
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction, button):
@@ -423,6 +577,10 @@ class TicketControls(discord.ui.View):
             0x57F287
         )
 
+        # Staff stats: approval
+        add_staff_stat(interaction.guild.id, interaction.user.id, "approvals", 1)
+        await save_staff_stats(interaction.guild.id, interaction.user.id)
+
         await interaction.response.send_message("Approved")
         await interaction.channel.delete()
 
@@ -454,6 +612,10 @@ class TicketControls(discord.ui.View):
             f"{interaction.user.mention} denied {member.mention}.",
             0xED4245
         )
+
+        # Staff stats: denial
+        add_staff_stat(interaction.guild.id, interaction.user.id, "denials", 1)
+        await save_staff_stats(interaction.guild.id, interaction.user.id)
 
         await interaction.response.send_message("Denied")
         await interaction.channel.delete()
@@ -488,6 +650,10 @@ class TicketControls(discord.ui.View):
             f"{interaction.user.mention} blacklisted {member.mention}.",
             0x000000
         )
+
+        # Staff stats: blacklist
+        add_staff_stat(interaction.guild.id, interaction.user.id, "blacklists", 1)
+        await save_staff_stats(interaction.guild.id, interaction.user.id)
 
         await interaction.response.send_message("Blacklisted")
         await interaction.channel.delete()
@@ -524,6 +690,10 @@ class TicketControls(discord.ui.View):
             ]
         )
 
+        # Staff stats: note
+        add_staff_stat(interaction.guild.id, interaction.user.id, "notes", 1)
+        await save_staff_stats(interaction.guild.id, interaction.user.id)
+
     @discord.ui.button(label="Request Proof", style=discord.ButtonStyle.primary)
     async def request_proof(self, interaction, button):
         if not self.is_staff(interaction):
@@ -553,6 +723,10 @@ class TicketControls(discord.ui.View):
             ]
         )
 
+        # Staff stats: proof request
+        add_staff_stat(interaction.guild.id, interaction.user.id, "proof_requests", 1)
+        await save_staff_stats(interaction.guild.id, interaction.user.id)
+
         await interaction.response.send_message("Requested proof from user.", ephemeral=True)
 
     @discord.ui.button(label="Escalate", style=discord.ButtonStyle.secondary)
@@ -575,6 +749,10 @@ class TicketControls(discord.ui.View):
             ]
         )
 
+        # Staff stats: escalation
+        add_staff_stat(interaction.guild.id, interaction.user.id, "escalations", 1)
+        await save_staff_stats(interaction.guild.id, interaction.user.id)
+
         await interaction.response.send_message("Ticket escalated.", ephemeral=True)
 
     @discord.ui.button(label="Bot Automation 🤖", style=discord.ButtonStyle.primary)
@@ -593,14 +771,15 @@ class TicketControls(discord.ui.View):
         # Gender-specific SAFE questions
         if self.gender == "female":
             questions = [
-                "1️⃣ Who invited you to this server?",
-                "2️⃣ Send a Short Voice message to prove you are a female "
-            
+                "1️⃣ Who invited you to this server?"
+                "2️⃣ send a VM of you speaking to prove your gender",
+                "3️⃣ Anything else you’d like staff to know?"
             ]
         else:  # male
             questions = [
-                "PoF $1000.00 Usd OR ",
-                "Invite 3 girls to be verified in the server"
+                "1️⃣ Who invited you to this server?"
+                "2️⃣  Pof $1000.00 to be accepted",
+                "3️⃣ IF you don't invite 3 girls."
             ]
 
         answers = []
@@ -618,7 +797,10 @@ class TicketControls(discord.ui.View):
 
         start_time = discord.utils.utcnow()
 
-        for q in questions:
+        # Automation Path Log
+        path_log = []
+
+        for idx, q in enumerate(questions):
             await channel.send(q)
             q_start = discord.utils.utcnow()
             try:
@@ -627,6 +809,7 @@ class TicketControls(discord.ui.View):
                 answers.append("[No response — timed out]")
                 response_times.append("timeout")
                 lengths.append(0)
+                path_log.append(f"Q{idx+1}: no response (timeout)")
                 break
             q_end = discord.utils.utcnow()
             diff = (q_end - q_start).total_seconds()
@@ -636,9 +819,11 @@ class TicketControls(discord.ui.View):
             if "optional" in q.lower() and content.lower() == "skip":
                 answers.append("[User skipped]")
                 lengths.append(0)
+                path_log.append(f"Q{idx+1}: skipped")
             else:
                 answers.append(content[:500])
                 lengths.append(len(content))
+                path_log.append(f"Q{idx+1}: answered")
 
         q1 = answers[0] if len(answers) > 0 else "N/A"
         q2 = answers[1] if len(answers) > 1 else "N/A"
@@ -683,6 +868,31 @@ class TicketControls(discord.ui.View):
 
         await channel.send(embed=summary_embed)
 
+        # Automation Path Log
+        await log_action(
+            interaction.guild,
+            "🤖 Automation Path",
+            f"Automation path for {member.mention}:",
+            color=0x2b2d31,
+            fields=[
+                ("User", member.mention, True),
+                ("Path", "\n".join(path_log)[:1000], False)
+            ]
+        )
+
+        # Automation Efficiency Log
+        await log_action(
+            interaction.guild,
+            "🧮 Automation Efficiency",
+            f"Automation completed for {member.mention}.",
+            color=0x57F287,
+            fields=[
+                ("User", member.mention, True),
+                ("Questions", str(len(questions)), True),
+                ("Duration", f"{total_duration:.1f}s", True)
+            ]
+        )
+
         await log_action(
             interaction.guild,
             "📄 Automated Verification Summary",
@@ -701,6 +911,10 @@ class TicketControls(discord.ui.View):
                 ("Q3 Time", response_times[2] if len(response_times) > 2 else "N/A", True)
             ]
         )
+
+        # Staff stats: automation run
+        add_staff_stat(interaction.guild.id, interaction.user.id, "automation_runs", 1)
+        await save_staff_stats(interaction.guild.id, interaction.user.id)
 
 
 # =========================
@@ -856,6 +1070,23 @@ async def on_member_join(member):
         topic=f"ticket_for:{member.id}"
     )
 
+    # Initialize ticket tracking
+    ticket_tracking[channel.id] = {
+        "user_id": member.id,
+        "staff_id": None,
+        "created_at": discord.utils.utcnow(),
+        "last_user_msg": None,
+        "last_staff_msg": None,
+        "user_msg_count": 0,
+        "staff_msg_count": 0,
+        "attachments": [],
+        "links": [],
+        "silence_windows": [],
+        "last_msg_time": None,
+        "retries": 0,
+        "followups": 0,
+    }
+
     embed = discord.Embed(
         title="WELCOME TO THE SERVER",
         description=(
@@ -959,8 +1190,9 @@ async def on_message(message):
     channel = message.channel
     guild_cfg = get_guild_config(guild.id)
 
-    # Flood tracking
     now_ts = time.time()
+
+    # Flood tracking
     ch_map = message_flood.setdefault(channel.id, {})
     user_times = ch_map.setdefault(message.author.id, [])
     user_times.append(now_ts)
@@ -979,6 +1211,52 @@ async def on_message(message):
             ]
         )
 
+        # Conversation Temperature Log
+        await log_action(
+            guild,
+            "🔥 Conversation Temperature",
+            f"High activity detected in {channel.mention}.",
+            color=0xED4245,
+            fields=[
+                ("User", message.author.mention, True),
+                ("Messages (10s)", str(len(user_times)), True),
+                ("Temperature", "HIGH", True)
+            ]
+        )
+
+    # Ticket tracking: micro-delays, silence windows, density
+    if _is_ticket_channel(guild, channel):
+        track = ticket_tracking.get(channel.id)
+        now_dt = discord.utils.utcnow()
+        if track:
+            if track["last_msg_time"]:
+                diff = (now_dt - track["last_msg_time"]).total_seconds()
+                # Micro-delay log
+                await log_action(
+                    guild,
+                    "⏱ Micro-Delay",
+                    f"Delay between messages in {channel.mention}.",
+                    color=0x2b2d31,
+                    fields=[
+                        ("Channel", channel.mention, True),
+                        ("Delay", f"{diff:.1f}s", True)
+                    ]
+                )
+                # Silence window if > 30s
+                if diff > 30:
+                    track["silence_windows"].append(diff)
+                    await log_action(
+                        guild,
+                        "🔇 Silence Window",
+                        f"Silence detected in {channel.mention}.",
+                        color=0x99AAB5,
+                        fields=[
+                            ("Channel", channel.mention, True),
+                            ("Duration", f"{diff:.1f}s", True)
+                        ]
+                    )
+            track["last_msg_time"] = now_dt
+
     # Attachments
     if message.attachments and _is_ticket_channel(guild, channel):
         await log_action(
@@ -993,6 +1271,22 @@ async def on_message(message):
                 ("Attachment Count", str(len(message.attachments)), True)
             ]
         )
+        track = ticket_tracking.get(channel.id)
+        if track:
+            for a in message.attachments:
+                track["attachments"].append((a.content_type or "unknown", a.size, discord.utils.utcnow()))
+                # Attachment Timeline Log
+                await log_action(
+                    guild,
+                    "📎 Attachment Timeline",
+                    f"Attachment logged in {channel.mention}.",
+                    color=0x2b2d31,
+                    fields=[
+                        ("User", message.author.mention, True),
+                        ("Type", a.content_type or "unknown", True),
+                        ("Size", f"{a.size} bytes", True)
+                    ]
+                )
 
     # Links
     if _is_ticket_channel(guild, channel):
@@ -1011,6 +1305,20 @@ async def on_message(message):
                     ("Links", "\n".join(links[:5]), False)
                 ]
             )
+            track = ticket_tracking.get(channel.id)
+            if track:
+                track["links"].extend(links)
+                # Link Behavior Log
+                await log_action(
+                    guild,
+                    "🔗 Link Behavior",
+                    f"Link behavior recorded in {channel.mention}.",
+                    color=0x2b2d31,
+                    fields=[
+                        ("User", message.author.mention, True),
+                        ("Link Count", str(len(links)), True)
+                    ]
+                )
 
     # Mentions staff
     staff_role = guild.get_role(guild_cfg.get("staff_role")) if guild_cfg.get("staff_role") else None
@@ -1040,6 +1348,36 @@ async def on_message(message):
             (staff_role and staff_role in message.author.roles)
         )
 
+        track = ticket_tracking.get(channel.id)
+        now_dt = discord.utils.utcnow()
+
+        # Count messages
+        if track:
+            if is_staff:
+                track["staff_msg_count"] += 1
+                # Staff messages stat
+                add_staff_stat(guild.id, message.author.id, "staff_messages", 1)
+                await save_staff_stats(guild.id, message.author.id)
+
+                # Staff response latency
+                if track["last_user_msg"]:
+                    diff = (now_dt - track["last_user_msg"]).total_seconds()
+                    add_staff_response_time(guild.id, message.author.id, diff)
+                    await log_action(
+                        guild,
+                        "🕒 Staff Response Time",
+                        f"Staff response time recorded in {channel.mention}.",
+                        color=0x57F287,
+                        fields=[
+                            ("Staff", message.author.mention, True),
+                            ("Delay", f"{diff:.1f}s", True)
+                        ]
+                    )
+                track["last_staff_msg"] = now_dt
+            else:
+                track["user_msg_count"] += 1
+                track["last_user_msg"] = now_dt
+
         # Staff claim
         if is_staff and "claimed_by:" not in channel.topic:
             new_topic = channel.topic + f"|claimed_by:{message.author.id}"
@@ -1061,6 +1399,14 @@ async def on_message(message):
                 ]
             )
 
+            # Staff stats: ticket claimed
+            add_staff_stat(guild.id, message.author.id, "tickets_claimed", 1)
+            await save_staff_stats(guild.id, message.author.id)
+
+            if track:
+                track["staff_id"] = message.author.id
+                track["staff_claim_time"] = now_dt
+
         # Staff takeover attempt
         if is_staff and "claimed_by:" in channel.topic:
             try:
@@ -1081,6 +1427,18 @@ async def on_message(message):
                     ]
                 )
 
+                # Staff Handoff Log
+                await log_action(
+                    guild,
+                    "🔄 Staff Handoff",
+                    f"Potential staff handoff in {channel.mention}.",
+                    color=0xFEE75C,
+                    fields=[
+                        ("Original Staff", f"<@{claimed_id}>", True),
+                        ("New Staff", message.author.mention, True)
+                    ]
+                )
+
         # Alias logging
         if user_id and message.author.id == user_id and "alias_logged" not in channel.topic:
             await channel.edit(topic=channel.topic + "|alias_logged")
@@ -1095,6 +1453,21 @@ async def on_message(message):
                     ("User ID", str(message.author.id), True),
                     ("Channel", channel.mention, True),
                     ("Alias", message.content[:200], False)
+                ]
+            )
+
+        # Ticket Structure Log (periodic)
+        if track and (track["user_msg_count"] + track["staff_msg_count"]) % 10 == 0:
+            await log_action(
+                guild,
+                "🧱 Ticket Structure",
+                f"Structure snapshot for {channel.mention}.",
+                color=0x2b2d31,
+                fields=[
+                    ("User Messages", str(track["user_msg_count"]), True),
+                    ("Staff Messages", str(track["staff_msg_count"]), True),
+                    ("Attachments", str(len(track["attachments"])), True),
+                    ("Links", str(len(track["links"])), True)
                 ]
             )
 
@@ -1127,6 +1500,18 @@ async def on_message_edit(before, after):
         ]
     )
 
+    # Retry Log (if user re-edits multiple times)
+    await log_action(
+        before.guild,
+        "♻️ Retry",
+        f"{before.author.mention} modified their message in {before.channel.mention}.",
+        color=0x2b2d31,
+        fields=[
+            ("User", before.author.mention, True),
+            ("Channel", before.channel.mention, True)
+        ]
+    )
+
 
 @bot.event
 async def on_message_delete(message):
@@ -1145,6 +1530,18 @@ async def on_message_delete(message):
             ("User ID", str(message.author.id), True),
             ("Channel", message.channel.mention, True),
             ("Content", message.content[:200] or "[empty]", False)
+        ]
+    )
+
+    # Retry Log (delete + resend pattern is captured over time)
+    await log_action(
+        message.guild,
+        "♻️ Retry",
+        f"{message.author.mention} deleted a message in {message.channel.mention}.",
+        color=0x2b2d31,
+        fields=[
+            ("User", message.author.mention, True),
+            ("Channel", message.channel.mention, True)
         ]
     )
 
@@ -1179,7 +1576,7 @@ async def staff_inactivity_check():
 
 
 # =========================
-# DAILY SUMMARY
+# DAILY SUMMARY + FUNNEL
 # =========================
 async def daily_summary():
     await bot.wait_until_ready()
@@ -1205,6 +1602,18 @@ async def daily_summary():
                         ("Blacklisted", str(stats["blacklisted"]), True),
                         ("Auto-Kicked", str(stats["autokicked"]), True),
                         ("Peak Join Hour", str(peak_hour), True)
+                    ]
+                )
+
+                # Join Pattern Log
+                await log_action(
+                    guild,
+                    "📊 Join Pattern",
+                    "Join pattern snapshot for today.",
+                    color=0x2b2d31,
+                    fields=[
+                        ("Join Count", str(len(stats["joins"])), True),
+                        ("Peak Hour", str(peak_hour), True)
                     ]
                 )
 
@@ -1243,6 +1652,115 @@ async def on_disconnect():
 
 
 # =========================
+# STAFF LEADERBOARD
+# =========================
+@bot.command()
+@commands.has_permissions(manage_guild=True)
+async def staffboard(ctx):
+    guild = ctx.guild
+
+    # Build leaderboard from staff_cache
+    entries = []
+    for (g_id, staff_id), data in staff_cache.items():
+        if g_id != guild.id:
+            continue
+        member = guild.get_member(staff_id)
+        if not member:
+            continue
+
+        # Simple scoring system
+        score = (
+            data["tickets_claimed"] * 3 +
+            data["tickets_closed"] * 4 +
+            data["approvals"] * 3 +
+            data["denials"] * 2 +
+            data["blacklists"] * 5 +
+            data["escalations"] * 2 +
+            data["notes"] * 1 +
+            data["proof_requests"] * 1 +
+            data["automation_runs"] * 2
+        )
+        entries.append((member, data, score))
+
+    if not entries:
+        return await ctx.send("No staff activity recorded yet.")
+
+    entries.sort(key=lambda x: x[2], reverse=True)
+    top3 = entries[:3]
+
+    embed = discord.Embed(
+        title="🏆 Staff Leaderboard",
+        description="Top performing staff based on ticket activity and actions.",
+        color=0xF1C40F
+    )
+    embed.set_footer(text=f"{guild.name} • Staff Performance")
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    for idx, (member, data, score) in enumerate(top3):
+        avg_response = (
+            data["total_response_time"] / data["response_events"]
+            if data["response_events"] > 0 else 0
+        )
+        value = (
+            f"**Score:** `{score}`\n"
+            f"• Tickets Claimed: `{data['tickets_claimed']}`\n"
+            f"• Tickets Closed: `{data['tickets_closed']}`\n"
+            f"• Approvals: `{data['approvals']}`\n"
+            f"• Denials: `{data['denials']}`\n"
+            f"• Blacklists: `{data['blacklists']}`\n"
+            f"• Escalations: `{data['escalations']}`\n"
+            f"• Notes: `{data['notes']}`\n"
+            f"• Proof Requests: `{data['proof_requests']}`\n"
+            f"• Automation Runs: `{data['automation_runs']}`\n"
+            f"• Staff Messages: `{data['staff_messages']}`\n"
+            f"• Avg Response: `{avg_response:.1f}s`\n"
+        )
+        embed.add_field(
+            name=f"{medals[idx]} {member.display_name}",
+            value=value,
+            inline=False
+        )
+
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_permissions(manage_guild=True)
+async def staffhistory(ctx, member: discord.Member):
+    guild = ctx.guild
+    data = staff_cache.get((guild.id, member.id))
+    if not data:
+        return await ctx.send("No history recorded for that staff member yet.")
+
+    avg_response = (
+        data["total_response_time"] / data["response_events"]
+        if data["response_events"] > 0 else 0
+    )
+
+    embed = discord.Embed(
+        title=f"📜 Staff History — {member.display_name}",
+        color=0x3498DB
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Tickets Claimed", value=str(data["tickets_claimed"]), inline=True)
+    embed.add_field(name="Tickets Closed", value=str(data["tickets_closed"]), inline=True)
+    embed.add_field(name="Approvals", value=str(data["approvals"]), inline=True)
+    embed.add_field(name="Denials", value=str(data["denials"]), inline=True)
+    embed.add_field(name="Blacklists", value=str(data["blacklists"]), inline=True)
+    embed.add_field(name="Escalations", value=str(data["escalations"]), inline=True)
+    embed.add_field(name="Notes", value=str(data["notes"]), inline=True)
+    embed.add_field(name="Proof Requests", value=str(data["proof_requests"]), inline=True)
+    embed.add_field(name="Automation Runs", value=str(data["automation_runs"]), inline=True)
+    embed.add_field(name="Staff Messages", value=str(data["staff_messages"]), inline=True)
+    embed.add_field(name="Follow-Ups", value=str(data["followups"]), inline=True)
+    embed.add_field(name="Avg Response Time", value=f"{avg_response:.1f}s", inline=True)
+    embed.add_field(name="Active Time", value=f"{data['active_time']:.1f}s", inline=True)
+
+    await ctx.send(embed=embed)
+
+
+# =========================
 # HELP MENU
 # =========================
 class HelpMenu(discord.ui.View):
@@ -1270,13 +1788,11 @@ class HelpMenu(discord.ui.View):
             color=0x57F287
         )
         embed.add_field(name=".setup", value="Initial server setup (per server).", inline=False)
-        embed.add_field(name="Approve Button", value="Approves a user.", inline=False)
-        embed.add_field(name="Deny Button", value="Denies a user.", inline=False)
-        embed.add_field(name="Blacklist Button", value="Blacklists a user.", inline=False)
-        embed.add_field(name="Add Note Button", value="Adds a note to logs.", inline=False)
-        embed.add_field(name="Request Proof Button", value="Requests proof from user.", inline=False)
-        embed.add_field(name="Escalate Button", value="Marks ticket as escalated.", inline=False)
-        embed.add_field(name="Bot Automation Button", value="Asks the user structured questions and summarizes answers for staff.", inline=False)
+        embed.add_field(name=".staffboard", value="Shows the staff leaderboard.", inline=False)
+        embed.add_field(name=".staffhistory <member>", value="Shows detailed stats for a staff member.", inline=False)
+        embed.add_field(name="Approve/Deny/Blacklist", value="Ticket decision buttons.", inline=False)
+        embed.add_field(name="Add Note / Request Proof / Escalate", value="Additional staff tools.", inline=False)
+        embed.add_field(name="Bot Automation", value="Automated Q&A with summary.", inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1298,10 +1814,10 @@ class HelpMenu(discord.ui.View):
     async def about(self, interaction, button):
         embed = discord.Embed(
             title="ℹ️ About This Bot",
-            description="Verification & moderation bot with logging, tickets, and staff tools.",
+            description="Verification & moderation bot with logging, tickets, staff tools, automation, and forensic analytics.",
             color=0xED4245
         )
-        embed.add_field(name="Features", value="Verification • Tickets • Logging • Staff Tools • Bot Automation", inline=False)
+        embed.add_field(name="Features", value="Verification • Tickets • Logging • Staff Tools • Bot Automation • Leaderboards", inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1325,6 +1841,7 @@ async def help(ctx):
 async def on_ready():
     await init_db()
     await load_config()
+    await load_staff_stats()
 
     for guild in bot.guilds:
         await ensure_config(guild)
