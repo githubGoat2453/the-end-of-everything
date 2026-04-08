@@ -550,7 +550,7 @@ async def unblacklist(ctx, user_id: int):
 
 
 # =========================
-# GENDER BUTTONS (Now updates database)
+# GENDER BUTTONS (Fixed - now updates database)
 # =========================
 class GenderButtons(discord.ui.View):
     def __init__(self, user_id):
@@ -597,7 +597,7 @@ class GenderButtons(discord.ui.View):
         next_steps_embed = discord.Embed(
             title="Next Steps",
             description=(
-                "Answer the questions From the requirements tab.\n"
+                "Answer the questions From the requirements tab."
                 "The buttons below are staff only and you cannot click it."
             ),
             color=0x2b2d31
@@ -1623,7 +1623,7 @@ async def on_message_delete(message):
 
 
 # =========================
-# PROFESSIONAL ADMIN PANEL (Fixed + Improved UI)
+# PROFESSIONAL ADMIN PANEL (Clean + Action Buttons + Ping)
 # =========================
 class VerificationPanel(discord.ui.View):
     def __init__(self, guild, rows):
@@ -1640,8 +1640,6 @@ class VerificationPanel(discord.ui.View):
             description="Live monitoring • Auto-refreshes every 30 seconds",
             color=0x5865F2
         )
-        embed.set_thumbnail(url="https://i.imgur.com/8Zf9v0L.png")   # Professional icon
-        embed.set_image(url="https://i.imgur.com/5f5f5f5.png")       # Clean banner
         embed.timestamp = discord.utils.utcnow()
 
         start = self.current_page * 4
@@ -1667,7 +1665,7 @@ class VerificationPanel(discord.ui.View):
                       f"**Gender:** {gender.capitalize() if gender else 'Not selected'}",
                 inline=False
             )
-        embed.set_footer(text="Click buttons to take action • Panel auto-updates")
+        embed.set_footer(text="Use buttons below to take action • Panel auto-updates")
         return embed
 
     async def start(self, channel):
@@ -1715,11 +1713,12 @@ async def adminpanel(ctx):
 
     if not rows:
         await control_room.send(embed=discord.Embed(title="Control Room", description="✅ No active verifications.", color=0x57F287))
-        return await ctx.send("✅ Control Room updated.", ephemeral=True)
+        return await ctx.send(f"{ctx.author.mention} **Control Room updated.** No active verifications right now.", ephemeral=True)
 
     view = VerificationPanel(ctx.guild, rows)
     await view.start(control_room)
-    await ctx.send("✅ Professional Control Room opened with live timer and gender tracking.", ephemeral=True)
+
+    await ctx.send(f"{ctx.author.mention} **Control Room opened.** Please check the `#control-room` channel for the live panel with action buttons.", ephemeral=True)
 
 
 # =========================
@@ -1827,7 +1826,7 @@ async def on_disconnect():
 
 
 # =========================
-# STAFF LEADERBOARD + HISTORY + HELP (unchanged)
+# STAFF LEADERBOARD
 # =========================
 @bot.command()
 @commands.has_permissions(manage_guild=True)
@@ -1933,6 +1932,9 @@ async def staffhistory(ctx, member: discord.Member):
     await ctx.send(embed=embed)
 
 
+# =========================
+# HELP MENU
+# =========================
 class HelpMenu(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
