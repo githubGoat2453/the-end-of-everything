@@ -118,6 +118,20 @@ async def init_db():
         )
         """)
 
+        # Active verifications for Control Room
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS active_verifications (
+            user_id INTEGER,
+            guild_id INTEGER,
+            ticket_channel_id INTEGER,
+            join_timestamp INTEGER,
+            expires_timestamp INTEGER,
+            status TEXT,
+            gender TEXT DEFAULT NULL,
+            PRIMARY KEY (user_id, guild_id)
+        )
+        """)
+
         await db.commit()
 
 
@@ -272,6 +286,39 @@ def add_staff_active_time(guild_id, staff_id, seconds):
     data["active_time"] += seconds
 
 
+# Active Verification DB Helpers
+async def add_to_verification(user_id, guild_id, ticket_channel_id, expires_in=600):
+    join_ts = int(time.time())
+    expires_ts = join_ts + expires_in
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            INSERT OR REPLACE INTO active_verifications 
+            (user_id, guild_id, ticket_channel_id, join_timestamp, expires_timestamp, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, guild_id, ticket_channel_id, join_ts, expires_ts, "Waiting for verification"))
+        await db.commit()
+
+
+async def remove_from_verification(user_id, guild_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "DELETE FROM active_verifications WHERE user_id=? AND guild_id=?",
+            (user_id, guild_id)
+        )
+        await db.commit()
+
+
+async def get_active_verifications(guild_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT user_id, ticket_channel_id, join_timestamp, expires_timestamp, status, gender 
+            FROM active_verifications 
+            WHERE guild_id=?
+            ORDER BY join_timestamp DESC
+        """, (guild_id,)) as cursor:
+            return await cursor.fetchall()
+
+
 # =========================
 # LOGGING
 # =========================
@@ -301,6 +348,92 @@ async def log_action(guild, title, description, color=0x2b2d31, *, fields=None):
         await channel.send(embed=embed)
     except Exception as e:
         print(f"Failed to log action: {e}")
+
+
+# Control Room
+async def ensure_control_room(guild):
+    control_room = discord.utils.get(guild.text_channels, name="control-room")
+    if not control_room:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.owner: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True),
+        }
+        control_room = await guild.create_text_channel(
+            "control-room",
+            overwrites=overwrites,
+            topic="Owner-only verification control dashboard"
+        )
+        await log_action(guild, "🔐 Control Room Created", "Private owner-only control room has been created.", color=0x57F287)
+    return control_room
+
+
+# NEW: Ticket Transcript Saver
+async def save_ticket_transcript(channel, guild, reason="Ticket Closed"):
+    if not channel:
+        return
+
+    guild_cfg = get_guild_config(guild.id)
+    log_channel = guild.get_channel(guild_cfg.get("log_channel")) if guild_cfg.get("log_channel") else None
+    if not log_channel:
+        return
+
+    transcript_lines = []
+    transcript_lines.append(f"**Ticket Transcript** - {channel.name}")
+    transcript_lines.append(f"**Reason:** {reason}")
+    transcript_lines.append(f"**Created:** {channel.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    transcript_lines.append("=" * 60 + "\n")
+
+    try:
+        async for message in channel.history(limit=None, oldest_first=True):
+            timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            author = f"{message.author} ({message.author.id})"
+            if message.author.bot:
+                author += " [BOT]"
+
+            content = message.content if message.content else "[No text content]"
+
+            transcript_lines.append(f"[{timestamp}] {author}:")
+            transcript_lines.append(content)
+
+            if message.attachments:
+                attachments = ", ".join([a.filename for a in message.attachments])
+                transcript_lines.append(f"[Attachments: {attachments}]")
+
+            transcript_lines.append("-" * 40)
+    except Exception as e:
+        transcript_lines.append(f"\n[Error fetching messages: {e}]")
+
+    transcript_text = "\n".join(transcript_lines)
+
+    try:
+        filename = f"{channel.id}_transcript.txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(transcript_text)
+
+        file = discord.File(filename, filename=f"{channel.name}_transcript.txt")
+
+        embed = discord.Embed(
+            title="📜 Ticket Transcript",
+            description=f"Transcript for **{channel.name}**",
+            color=0x5865F2
+        )
+        embed.add_field(name="Reason", value=reason, inline=True)
+        embed.add_field(name="Channel ID", value=str(channel.id), inline=True)
+        embed.timestamp = discord.utils.utcnow()
+
+        await log_channel.send(embed=embed, file=file)
+        os.remove(filename)
+
+    except Exception as e:
+        await log_channel.send(
+            embed=discord.Embed(
+                title="📜 Ticket Transcript (Fallback)",
+                description=transcript_text[:4000],
+                color=0xED4245
+            )
+        )
+        print(f"Transcript error: {e}")
 
 
 # =========================
@@ -453,7 +586,6 @@ class GenderButtons(discord.ui.View):
             ]
         )
 
-        # Interaction Map: gender button pressed
         await log_action(
             interaction.guild,
             "🗺️ Interaction Map",
@@ -468,7 +600,6 @@ class GenderButtons(discord.ui.View):
         next_steps_embed = discord.Embed(
             title="Next Steps",
             description=(
-    
                 "Answer the questions From the requirements tab."
                 "The buttons below are staff only and you cannot click it."
             ),
@@ -515,7 +646,6 @@ class TicketControls(discord.ui.View):
         if extra_fields:
             fields.extend(extra_fields)
 
-        # Ticket Lifetime Log
         await log_action(
             interaction.guild,
             "🏗️ Ticket Lifetime",
@@ -535,7 +665,6 @@ class TicketControls(discord.ui.View):
             fields=fields
         )
 
-        # Staff stats: ticket closed
         add_staff_stat(interaction.guild.id, interaction.user.id, "tickets_closed", 1)
         await save_staff_stats(interaction.guild.id, interaction.user.id)
 
@@ -577,9 +706,13 @@ class TicketControls(discord.ui.View):
             0x57F287
         )
 
-        # Staff stats: approval
         add_staff_stat(interaction.guild.id, interaction.user.id, "approvals", 1)
         await save_staff_stats(interaction.guild.id, interaction.user.id)
+
+        # Save transcript before deleting
+        await save_ticket_transcript(interaction.channel, interaction.guild, reason="Approved by Staff")
+
+        await remove_from_verification(self.user_id, interaction.guild.id)
 
         await interaction.response.send_message("Approved")
         await interaction.channel.delete()
@@ -613,9 +746,13 @@ class TicketControls(discord.ui.View):
             0xED4245
         )
 
-        # Staff stats: denial
         add_staff_stat(interaction.guild.id, interaction.user.id, "denials", 1)
         await save_staff_stats(interaction.guild.id, interaction.user.id)
+
+        # Save transcript before deleting
+        await save_ticket_transcript(interaction.channel, interaction.guild, reason="Denied by Staff")
+
+        await remove_from_verification(self.user_id, interaction.guild.id)
 
         await interaction.response.send_message("Denied")
         await interaction.channel.delete()
@@ -651,9 +788,13 @@ class TicketControls(discord.ui.View):
             0x000000
         )
 
-        # Staff stats: blacklist
         add_staff_stat(interaction.guild.id, interaction.user.id, "blacklists", 1)
         await save_staff_stats(interaction.guild.id, interaction.user.id)
+
+        # Save transcript before deleting
+        await save_ticket_transcript(interaction.channel, interaction.guild, reason="Blacklisted by Staff")
+
+        await remove_from_verification(self.user_id, interaction.guild.id)
 
         await interaction.response.send_message("Blacklisted")
         await interaction.channel.delete()
@@ -690,7 +831,6 @@ class TicketControls(discord.ui.View):
             ]
         )
 
-        # Staff stats: note
         add_staff_stat(interaction.guild.id, interaction.user.id, "notes", 1)
         await save_staff_stats(interaction.guild.id, interaction.user.id)
 
@@ -723,7 +863,6 @@ class TicketControls(discord.ui.View):
             ]
         )
 
-        # Staff stats: proof request
         add_staff_stat(interaction.guild.id, interaction.user.id, "proof_requests", 1)
         await save_staff_stats(interaction.guild.id, interaction.user.id)
 
@@ -749,7 +888,6 @@ class TicketControls(discord.ui.View):
             ]
         )
 
-        # Staff stats: escalation
         add_staff_stat(interaction.guild.id, interaction.user.id, "escalations", 1)
         await save_staff_stats(interaction.guild.id, interaction.user.id)
 
@@ -768,16 +906,15 @@ class TicketControls(discord.ui.View):
 
         channel = interaction.channel
 
-        # Gender-specific SAFE questions
         if self.gender == "female":
             questions = [
-                "1️⃣ Who invited you to this server?"
+                "1️⃣ Who invited you to this server?",
                 "2️⃣ send a VM of you speaking to prove your gender",
                 "3️⃣ Anything else you’d like staff to know?"
             ]
-        else:  # male
+        else:
             questions = [
-                "1️⃣ Who invited you to this server?"
+                "1️⃣ Who invited you to this server?",
                 "2️⃣  Pof $1000.00 to be accepted",
                 "3️⃣ IF you don't invite 3 girls."
             ]
@@ -785,6 +922,7 @@ class TicketControls(discord.ui.View):
         answers = []
         response_times = []
         lengths = []
+        path_log = []
 
         def check_user(m):
             return m.author.id == member.id and m.channel == channel
@@ -796,9 +934,6 @@ class TicketControls(discord.ui.View):
         )
 
         start_time = discord.utils.utcnow()
-
-        # Automation Path Log
-        path_log = []
 
         for idx, q in enumerate(questions):
             await channel.send(q)
@@ -816,14 +951,9 @@ class TicketControls(discord.ui.View):
             response_times.append(f"{diff:.1f}s")
 
             content = msg.content.strip()
-            if "optional" in q.lower() and content.lower() == "skip":
-                answers.append("[User skipped]")
-                lengths.append(0)
-                path_log.append(f"Q{idx+1}: skipped")
-            else:
-                answers.append(content[:500])
-                lengths.append(len(content))
-                path_log.append(f"Q{idx+1}: answered")
+            answers.append(content[:500])
+            lengths.append(len(content))
+            path_log.append(f"Q{idx+1}: answered")
 
         q1 = answers[0] if len(answers) > 0 else "N/A"
         q2 = answers[1] if len(answers) > 1 else "N/A"
@@ -838,87 +968,25 @@ class TicketControls(discord.ui.View):
             color=0x2b2d31
         )
         summary_embed.add_field(name="Q1: Who invited you?", value=q1, inline=False)
-        summary_embed.add_field(
-            name="Q2: Extra verification (optional)",
-            value=q2,
-            inline=False
-        )
-        summary_embed.add_field(
-            name="Q3: Anything else?",
-            value=q3,
-            inline=False
-        )
-        summary_embed.add_field(
-            name="Response Times",
-            value="\n".join(
-                f"Q{i+1}: {response_times[i] if i < len(response_times) else 'N/A'}"
-                for i in range(len(questions))
-            ),
-            inline=False
-        )
-        summary_embed.add_field(
-            name="Message Lengths",
-            value="\n".join(
-                f"Q{i+1}: {lengths[i] if i < len(lengths) else 0} chars"
-                for i in range(len(questions))
-            ),
-            inline=False
-        )
+        summary_embed.add_field(name="Q2: Extra verification (optional)", value=q2, inline=False)
+        summary_embed.add_field(name="Q3: Anything else?", value=q3, inline=False)
+        summary_embed.add_field(name="Response Times", value="\n".join(f"Q{i+1}: {response_times[i] if i < len(response_times) else 'N/A'}" for i in range(len(questions))), inline=False)
+        summary_embed.add_field(name="Message Lengths", value="\n".join(f"Q{i+1}: {lengths[i] if i < len(lengths) else 0} chars" for i in range(len(questions))), inline=False)
         summary_embed.set_footer(text=f"Bot Automation • Duration: {total_duration:.1f}s • Staff Review Required")
 
         await channel.send(embed=summary_embed)
 
-        # Automation Path Log
-        await log_action(
-            interaction.guild,
-            "🤖 Automation Path",
-            f"Automation path for {member.mention}:",
-            color=0x2b2d31,
-            fields=[
-                ("User", member.mention, True),
-                ("Path", "\n".join(path_log)[:1000], False)
-            ]
-        )
+        await log_action(interaction.guild, "🤖 Automation Path", f"Automation path for {member.mention}:", color=0x2b2d31, fields=[("User", member.mention, True), ("Path", "\n".join(path_log)[:1000], False)])
+        await log_action(interaction.guild, "🧮 Automation Efficiency", f"Automation completed for {member.mention}.", color=0x57F287, fields=[("User", member.mention, True), ("Questions", str(len(questions)), True), ("Duration", f"{total_duration:.1f}s", True)])
+        await log_action(interaction.guild, "📄 Automated Verification Summary", f"Automated Q&A completed for {member.mention}.", color=0x2b2d31, fields=[("User", member.mention, True), ("User ID", str(member.id), True), ("Gender", self.gender.capitalize(), True), ("Q1", q1[:150], False), ("Q2", q2[:150], False), ("Q3", q3[:150], False), ("Total Duration", f"{total_duration:.1f}s", True)])
 
-        # Automation Efficiency Log
-        await log_action(
-            interaction.guild,
-            "🧮 Automation Efficiency",
-            f"Automation completed for {member.mention}.",
-            color=0x57F287,
-            fields=[
-                ("User", member.mention, True),
-                ("Questions", str(len(questions)), True),
-                ("Duration", f"{total_duration:.1f}s", True)
-            ]
-        )
-
-        await log_action(
-            interaction.guild,
-            "📄 Automated Verification Summary",
-            f"Automated Q&A completed for {member.mention}.",
-            color=0x2b2d31,
-            fields=[
-                ("User", member.mention, True),
-                ("User ID", str(member.id), True),
-                ("Gender", self.gender.capitalize(), True),
-                ("Q1", q1[:150], False),
-                ("Q2", q2[:150], False),
-                ("Q3", q3[:150], False),
-                ("Total Duration", f"{total_duration:.1f}s", True),
-                ("Q1 Time", response_times[0] if len(response_times) > 0 else "N/A", True),
-                ("Q2 Time", response_times[1] if len(response_times) > 1 else "N/A", True),
-                ("Q3 Time", response_times[2] if len(response_times) > 2 else "N/A", True)
-            ]
-        )
-
-        # Staff stats: automation run
         add_staff_stat(interaction.guild.id, interaction.user.id, "automation_runs", 1)
         await save_staff_stats(interaction.guild.id, interaction.user.id)
 
+
 async def start_timer(channel, member, duration=600):
     end_time = time.time() + duration
-    warned = False  # prevents spam ping
+    warned = False
 
     embed = discord.Embed(
         title="⏳ Verification Timer",
@@ -942,12 +1010,9 @@ async def start_timer(channel, member, duration=600):
 
             embed.description = f"Time remaining: **{minutes:02d}:{seconds:02d}**"
 
-            # ⚠️ 1 MINUTE WARNING
             if remaining <= 60 and not warned:
                 warned = True
-                await channel.send(
-                    f"⚠️ {member.mention} you have **1 minute left** to complete verification!"
-                )
+                await channel.send(f"⚠️ {member.mention} you have **1 minute left** to complete verification!")
 
             await msg.edit(embed=embed)
             await asyncio.sleep(1)
@@ -994,6 +1059,8 @@ async def auto_kick_if_unverified(member_id, guild_id, delay=600):
                 ("Reason", "Verification timeout", True)
             ]
         )
+
+        await remove_from_verification(member_id, guild_id)
 
 
 # =========================
@@ -1087,20 +1154,9 @@ async def on_member_join(member):
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        member: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True
-        ),
-        staff_role: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True
-        ) if staff_role else None,
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True,
-            read_message_history=True
-        )
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        staff_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True) if staff_role else None,
+        guild.me: discord.PermissionOverwrite(view_channel=True, read_message_history=True)
     }
     overwrites = {k: v for k, v in overwrites.items() if v is not None}
 
@@ -1111,7 +1167,8 @@ async def on_member_join(member):
         topic=f"ticket_for:{member.id}"
     )
 
-    # Initialize ticket tracking
+    await add_to_verification(member.id, guild.id, channel.id, expires_in=600)
+
     ticket_tracking[channel.id] = {
         "user_id": member.id,
         "staff_id": None,
@@ -1166,7 +1223,7 @@ async def on_member_join(member):
 
 
 # =========================
-# MEMBER LEAVE
+# MEMBER LEAVE - Now saves transcript
 # =========================
 @bot.event
 async def on_member_remove(member):
@@ -1179,6 +1236,8 @@ async def on_member_remove(member):
             break
 
     if ticket_channel:
+        await save_ticket_transcript(ticket_channel, guild, reason="User Left During Verification")
+
         await log_action(
             guild,
             "🚪 User Left During Verification",
@@ -1190,6 +1249,11 @@ async def on_member_remove(member):
                 ("Ticket", ticket_channel.mention, True)
             ]
         )
+
+        try:
+            await ticket_channel.delete()
+        except:
+            pass
     else:
         await log_action(
             guild,
@@ -1253,7 +1317,6 @@ async def on_message(message):
             ]
         )
 
-        # Conversation Temperature Log
         await log_action(
             guild,
             "🔥 Conversation Temperature",
@@ -1266,14 +1329,12 @@ async def on_message(message):
             ]
         )
 
-    # Ticket tracking: micro-delays, silence windows, density
     if _is_ticket_channel(guild, channel):
         track = ticket_tracking.get(channel.id)
         now_dt = discord.utils.utcnow()
         if track:
             if track["last_msg_time"]:
                 diff = (now_dt - track["last_msg_time"]).total_seconds()
-                # Micro-delay log
                 await log_action(
                     guild,
                     "⏱ Micro-Delay",
@@ -1284,7 +1345,6 @@ async def on_message(message):
                         ("Delay", f"{diff:.1f}s", True)
                     ]
                 )
-                # Silence window if > 30s
                 if diff > 30:
                     track["silence_windows"].append(diff)
                     await log_action(
@@ -1299,7 +1359,6 @@ async def on_message(message):
                     )
             track["last_msg_time"] = now_dt
 
-    # Attachments
     if message.attachments and _is_ticket_channel(guild, channel):
         await log_action(
             guild,
@@ -1317,7 +1376,6 @@ async def on_message(message):
         if track:
             for a in message.attachments:
                 track["attachments"].append((a.content_type or "unknown", a.size, discord.utils.utcnow()))
-                # Attachment Timeline Log
                 await log_action(
                     guild,
                     "📎 Attachment Timeline",
@@ -1330,7 +1388,6 @@ async def on_message(message):
                     ]
                 )
 
-    # Links
     if _is_ticket_channel(guild, channel):
         words = message.content.split()
         links = [w for w in words if w.startswith("http://") or w.startswith("https://")]
@@ -1350,7 +1407,6 @@ async def on_message(message):
             track = ticket_tracking.get(channel.id)
             if track:
                 track["links"].extend(links)
-                # Link Behavior Log
                 await log_action(
                     guild,
                     "🔗 Link Behavior",
@@ -1362,7 +1418,6 @@ async def on_message(message):
                     ]
                 )
 
-    # Mentions staff
     staff_role = guild.get_role(guild_cfg.get("staff_role")) if guild_cfg.get("staff_role") else None
     if staff_role and staff_role in message.role_mentions and _is_ticket_channel(guild, channel):
         await log_action(
@@ -1377,7 +1432,6 @@ async def on_message(message):
             ]
         )
 
-    # Ticket logic
     if _is_ticket_channel(guild, channel):
         try:
             user_id = int(channel.topic.split("ticket_for:")[1].split("|")[0])
@@ -1393,15 +1447,12 @@ async def on_message(message):
         track = ticket_tracking.get(channel.id)
         now_dt = discord.utils.utcnow()
 
-        # Count messages
         if track:
             if is_staff:
                 track["staff_msg_count"] += 1
-                # Staff messages stat
                 add_staff_stat(guild.id, message.author.id, "staff_messages", 1)
                 await save_staff_stats(guild.id, message.author.id)
 
-                # Staff response latency
                 if track["last_user_msg"]:
                     diff = (now_dt - track["last_user_msg"]).total_seconds()
                     add_staff_response_time(guild.id, message.author.id, diff)
@@ -1420,7 +1471,6 @@ async def on_message(message):
                 track["user_msg_count"] += 1
                 track["last_user_msg"] = now_dt
 
-        # Staff claim
         if is_staff and "claimed_by:" not in channel.topic:
             new_topic = channel.topic + f"|claimed_by:{message.author.id}"
 
@@ -1441,7 +1491,6 @@ async def on_message(message):
                 ]
             )
 
-            # Staff stats: ticket claimed
             add_staff_stat(guild.id, message.author.id, "tickets_claimed", 1)
             await save_staff_stats(guild.id, message.author.id)
 
@@ -1449,7 +1498,6 @@ async def on_message(message):
                 track["staff_id"] = message.author.id
                 track["staff_claim_time"] = now_dt
 
-        # Staff takeover attempt
         if is_staff and "claimed_by:" in channel.topic:
             try:
                 claimed_id = int(channel.topic.split("claimed_by:")[1].split("|")[0])
@@ -1469,7 +1517,6 @@ async def on_message(message):
                     ]
                 )
 
-                # Staff Handoff Log
                 await log_action(
                     guild,
                     "🔄 Staff Handoff",
@@ -1481,7 +1528,6 @@ async def on_message(message):
                     ]
                 )
 
-        # Alias logging
         if user_id and message.author.id == user_id and "alias_logged" not in channel.topic:
             await channel.edit(topic=channel.topic + "|alias_logged")
 
@@ -1498,7 +1544,6 @@ async def on_message(message):
                 ]
             )
 
-        # Ticket Structure Log (periodic)
         if track and (track["user_msg_count"] + track["staff_msg_count"]) % 10 == 0:
             await log_action(
                 guild,
@@ -1542,7 +1587,6 @@ async def on_message_edit(before, after):
         ]
     )
 
-    # Retry Log (if user re-edits multiple times)
     await log_action(
         before.guild,
         "♻️ Retry",
@@ -1575,7 +1619,6 @@ async def on_message_delete(message):
         ]
     )
 
-    # Retry Log (delete + resend pattern is captured over time)
     await log_action(
         message.guild,
         "♻️ Retry",
@@ -1586,6 +1629,97 @@ async def on_message_delete(message):
             ("Channel", message.channel.mention, True)
         ]
     )
+
+
+# =========================
+# ADMIN PANEL
+# =========================
+class VerificationPanel(discord.ui.View):
+    def __init__(self, guild, pages, control_room):
+        super().__init__(timeout=None)
+        self.guild = guild
+        self.pages = pages
+        self.current_page = 0
+        self.control_room = control_room
+
+    def get_embed(self):
+        if not self.pages:
+            return discord.Embed(title="Control Room — Verification Panel", description="No active verifications right now.", color=0x2b2d31)
+
+        data = self.pages[self.current_page]
+        embed = discord.Embed(
+            title=f"Control Room — Active Verifications (Page {self.current_page + 1}/{len(self.pages)})",
+            color=0x5865F2
+        )
+        embed.timestamp = discord.utils.utcnow()
+
+        for entry in data:
+            user_id, ticket_id, join_ts, expires_ts, status, gender = entry
+            member = self.guild.get_member(user_id)
+            username = member.display_name if member else f"Unknown (ID: {user_id})"
+
+            time_left = max(0, expires_ts - int(time.time()))
+            minutes, seconds = divmod(time_left, 60)
+
+            embed.add_field(
+                name=f"👤 {username}",
+                value=(
+                    f"**ID:** {user_id}\n"
+                    f"**Ticket:** <#{ticket_id}>\n"
+                    f"**⏳ Time Left:** {minutes}m {seconds}s\n"
+                    f"**📅 Joined:** <t:{join_ts}:R>\n"
+                    f"**📌 Status:** {status}\n"
+                    f"**Gender:** {gender or 'Not selected'}"
+                ),
+                inline=False
+            )
+        return embed
+
+    @discord.ui.button(label="⬅ Previous", style=discord.ButtonStyle.gray)
+    async def previous(self, interaction: discord.Interaction, button):
+        if self.current_page == 0:
+            return await interaction.response.defer()
+        self.current_page -= 1
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label="Next ➡", style=discord.ButtonStyle.gray)
+    async def next(self, interaction: discord.Interaction, button):
+        if self.current_page >= len(self.pages) - 1:
+            return await interaction.response.defer()
+        self.current_page += 1
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label="🗑 Close Panel", style=discord.ButtonStyle.danger)
+    async def close(self, interaction: discord.Interaction, button):
+        await interaction.response.defer()
+        try:
+            await interaction.message.delete()
+        except:
+            pass
+
+
+@bot.command()
+async def adminpanel(ctx):
+    if ctx.author != ctx.guild.owner:
+        return await ctx.send("❌ Only the server owner can use this command.", ephemeral=True)
+
+    control_room = await ensure_control_room(ctx.guild)
+
+    rows = await get_active_verifications(ctx.guild.id)
+
+    if not rows:
+        await control_room.send(embed=discord.Embed(
+            title="Control Room — Verification Panel",
+            description="✅ No users are currently in verification.",
+            color=0x57F287
+        ))
+        return await ctx.send("✅ Control Room updated (no active verifications).", ephemeral=True)
+
+    pages = [rows[i:i + 5] for i in range(0, len(rows), 5)]
+    view = VerificationPanel(ctx.guild, pages, control_room)
+    msg = await control_room.send(embed=view.get_embed(), view=view)
+
+    await ctx.send(f"✅ Control Room updated → [Jump to panel]({msg.jump_url})", ephemeral=True)
 
 
 # =========================
@@ -1618,7 +1752,7 @@ async def staff_inactivity_check():
 
 
 # =========================
-# DAILY SUMMARY + FUNNEL
+# DAILY SUMMARY
 # =========================
 async def daily_summary():
     await bot.wait_until_ready()
@@ -1647,7 +1781,6 @@ async def daily_summary():
                     ]
                 )
 
-                # Join Pattern Log
                 await log_action(
                     guild,
                     "📊 Join Pattern",
@@ -1701,7 +1834,6 @@ async def on_disconnect():
 async def staffboard(ctx):
     guild = ctx.guild
 
-    # Build leaderboard from staff_cache
     entries = []
     for (g_id, staff_id), data in staff_cache.items():
         if g_id != guild.id:
@@ -1710,7 +1842,6 @@ async def staffboard(ctx):
         if not member:
             continue
 
-        # Simple scoring system
         score = (
             data["tickets_claimed"] * 3 +
             data["tickets_closed"] * 4 +
@@ -1887,6 +2018,7 @@ async def on_ready():
 
     for guild in bot.guilds:
         await ensure_config(guild)
+        await ensure_control_room(guild)
         await log_action(
             guild,
             "🟣 Bot Started",
