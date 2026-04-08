@@ -118,7 +118,6 @@ async def init_db():
         )
         """)
 
-        # Active verifications for Control Room
         await db.execute("""
         CREATE TABLE IF NOT EXISTS active_verifications (
             user_id INTEGER,
@@ -251,7 +250,8 @@ async def load_staff_stats():
         """) as cursor:
             rows = await cursor.fetchall()
             for row in rows:
-                guild_id, staff_id = row[0], row[1]
+                guild_id = row[0]
+                staff_id = row[1]
                 staff_cache[(guild_id, staff_id)] = {
                     "tickets_claimed": row[2],
                     "tickets_closed": row[3],
@@ -550,7 +550,7 @@ async def unblacklist(ctx, user_id: int):
 
 
 # =========================
-# GENDER BUTTONS (Fixed - now updates database)
+# GENDER BUTTONS (Fixed)
 # =========================
 class GenderButtons(discord.ui.View):
     def __init__(self, user_id):
@@ -596,19 +596,12 @@ class GenderButtons(discord.ui.View):
 
         next_steps_embed = discord.Embed(
             title="Next Steps",
-            description=(
-                "Answer the questions From the requirements tab."
-                "The buttons below are staff only and you cannot click it."
-            ),
+            description="Answer the questions below.\nStaff will review shortly.",
             color=0x2b2d31
         )
 
         await interaction.channel.send(embed=next_steps_embed)
-
-        await interaction.channel.send(
-            "🎫 Staff Controls:",
-            view=TicketControls(self.user_id, gender)
-        )
+        await interaction.channel.send("🎫 Staff Controls:", view=TicketControls(self.user_id, gender))
 
 
 # =========================
