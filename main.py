@@ -7,27 +7,28 @@ import time
 from collections import defaultdict
 
 # ========================
-# SAFE GROK CLIENT SETUP
+# GOOGLE GEMINI SETUP (FREE)
 # ========================
 from openai import AsyncOpenAI
 
-grok_client = None
-grok_api_key = os.getenv("GROK_API_KEY")
+gemini_client = None
+gemini_api_key = os.getenv("GEMINI_API_KEY")
 
-if grok_api_key:
+if gemini_api_key:
     try:
-        grok_client = AsyncOpenAI(
-            api_key=grok_api_key,
-            base_url="https://api.x.ai/v1"
+        gemini_client = AsyncOpenAI(
+            api_key=gemini_api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
         )
-        print("✅ Grok client initialized successfully (using grok-4)")
+        print("✅ Gemini client initialized successfully (free tier)")
     except Exception as e:
-        print(f"❌ Failed to initialize Grok client: {e}")
-        grok_client = None
+        print(f"❌ Gemini setup failed: {e}")
+        gemini_client = None
 else:
-    print("⚠️  WARNING: GROK_API_KEY environment variable is not set!")
-    print("   Auto Judge will not work until you add the key in Railway Variables.")
-
+    print("⚠️ WARNING: GEMINI_API_KEY is not set in Railway Variables!")
+    print("   Add it in Railway → Variables → GEMINI_API_KEY")
+    gemini_client = None
+    
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=".", intents=intents)
 bot.remove_command("help")
@@ -1012,230 +1013,28 @@ class TicketControls(discord.ui.View):
         bot.loop.create_task(judge.start())
 
 
-# =========================
-# AUTO JUDGE CLASS
-# =========================
-# =========================
-# UPDATED GROK AUTO JUDGE - Full Owner DM Report
-# =========================
-class AutoJudge:
-    QUESTIONS = [
-        "1️⃣ Who invited you here or how did you find this server?",
-        "2️⃣ Do you know anyone in this server right now? If yes, who?",
-        "3️⃣ Why do you want to join this server?",
-        "4️⃣ Have you been in any other similar servers before?",
-        "5️⃣ What’s your main alias or username you use?",
-        "6️⃣ Can you send proof of money / balance right now? (screenshot or statement)",
-        "7️⃣ How long have you been using Discord?",
-        "8️⃣ What do you usually do in servers like this?",
-        "9️⃣ Are you a real person or using any automation? (be honest)",
-        "🔟 Anything else you want staff to know before we approve you?"
-    ]
+# ========================
+# GOOGLE GEMINI SETUP (FREE)
+# ========================
+from openai import AsyncOpenAI
 
-    def __init__(self, channel, member, gender):
-        self.channel = channel
-        self.member = member
-        self.gender = gender
-        self.history = []      # For Grok conversation memory
-        self.answers = []      # Stores user's raw answers for report
-        self.scores = []
-        self.q_index = 0
+gemini_client = None
+gemini_api_key = os.getenv("GEMINI_API_KEY")
 
-    async def analyze_image(self, attachment):
-        try:
-            resp = await grok_client.chat.completions.create(
-                model="grok-2-vision",
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Be direct and harsh. Is this money/balance screenshot real or fake/edited/suspicious? Look for bad editing, low quality, wrong fonts, weird shadows, etc."},
-                        {"type": "image_url", "image_url": {"url": attachment.url}}
-                    ]
-                }],
-                max_tokens=200,
-                temperature=0.7
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            print("Image analysis error:", e)
-            return "⚠️ Couldn't analyze the image properly."
-
-    async def get_grok_reply(self, user_message):
-        try:
-            messages = [
-                {"role": "system", "content": 
-                    "You are Grok, a chill but strict and savage verification judge. "
-                    "Talk naturally like a real person. Use emojis. "
-                    "If the answer is weak, short, or suspicious, call it out and debate them. "
-                    "Respond to everything the user says. Don't repeat yourself."
-                }
-            ]
-
-            for q, a in self.history[-10:]:
-                messages.append({"role": "user", "content": q})
-                messages.append({"role": "assistant", "content": a})
-
-            messages.append({"role": "user", "content": user_message})
-
-            resp = await grok_client.chat.completions.create(
-                model="grok-4",
-                messages=messages,
-                max_tokens=170,
-                temperature=0.90
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            print("Grok reply error:", e)
-            return "Bro... that's weak 💀 Give a real answer."
-
-    async def start(self):
-        await self.channel.send(f"🔍 **Grok Auto Judge Started** — {self.member.mention}\nAnswer properly or get called out 🔥")
-
-        await self.channel.send(self.QUESTIONS[0])
-
-        while self.q_index < len(self.QUESTIONS):
-            def check(m):
-                return m.author == self.member and m.channel == self.channel
-
-            try:
-                msg = await bot.wait_for("message", check=check, timeout=300)
-            except asyncio.TimeoutError:
-                await self.channel.send("⏰ You took too long. Ending Auto Judge.")
-                return await self.finish()
-
-            if msg.content.strip().lower() == "next question":
-                self.q_index += 1
-                if self.q_index < len(self.QUESTIONS):
-                    await self.channel.send(self.QUESTIONS[self.q_index])
-                continue
-
-            # Store answer for report
-            self.history.append((self.QUESTIONS[self.q_index], msg.content))
-            self.answers.append(msg.content)
-
-            # Image detection
-            if msg.attachments:
-                for att in msg.attachments:
-                    if att.content_type and att.content_type.startswith("image"):
-                        analysis = await self.analyze_image(att)
-                        await self.channel.send(f"📸 **Grok Image Analysis:** {analysis}")
-
-            # Grok's reply
-            reply = await self.get_grok_reply(msg.content)
-            await self.channel.send(reply)
-
-            # Score
-            score = self._score_answer(msg.content, bool(msg.attachments))
-            self.scores.append(score)
-
-            self.q_index += 1
-
-            if self.q_index < len(self.QUESTIONS):
-                await asyncio.sleep(1.5)
-                await self.channel.send(self.QUESTIONS[self.q_index])
-
-        await self.finish()
-
-    def _score_answer(self, text, has_image):
-        score = 5
-        length = len(text.strip())
-
-        if length > 70: score += 6
-        elif length > 35: score += 3
-        if has_image: score += 8
-        if "money" in text.lower() or has_image: score += 5
-
-        if length < 15 or any(w in text.lower() for w in ["idk", "anything", "nothing", "lol", "lmao", "haha"]):
-            score -= 9
-        if any(w in text.lower() for w in ["nitro", "free", "raid", "bot", "automation"]):
-            score -= 10
-
-        return max(0, min(10, score))
-
-    async def finish(self):
-        total = sum(self.scores) * 2
-        guild = self.channel.guild
-        owner = guild.owner
-
-        # Full detailed report embed
-        report = discord.Embed(
-            title="🔍 Auto Judge Full Report",
-            description=f"**User:** {self.member.mention} (`{self.member.id}`)\n"
-                        f"**Gender:** {self.gender.capitalize()}\n"
-                        f"**Final Score:** `{total:.0f}/100`",
-            color=0x00FF00 if total >= 75 else 0xFF0000
+if gemini_api_key:
+    try:
+        gemini_client = AsyncOpenAI(
+            api_key=gemini_api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
         )
-
-        # Add all questions and answers
-        for i, (q, a) in enumerate(zip(self.QUESTIONS, self.answers), 1):
-            answer_text = a[:700] if a else "[No answer provided]"
-            report.add_field(
-                name=f"Q{i}: {q[:90]}...",
-                value=answer_text,
-                inline=False
-            )
-
-        report.add_field(
-            name="Verdict",
-            value="✅ **Auto-Approve Recommended**" if total >= 75 else "❌ **Staff Review Required**",
-            inline=False
-        )
-        report.set_footer(text="Grok Auto Judge • Always sent to owner")
-
-        # ALWAYS DM the owner
-        try:
-            await owner.send(embed=report)
-
-            # Ask for decision
-            confirm = discord.Embed(
-                title="Auto Judge Approval Request",
-                description=f"**User:** {self.member.mention}\n**Score:** `{total:.0f}/100`\n\n"
-                            f"Reply with **yes** to approve or **no** to reject.",
-                color=0x00FF00 if total >= 75 else 0xFF0000
-            )
-            await owner.send(embed=confirm)
-
-            def check(m):
-                return m.author == owner and m.guild is None
-
-            try:
-                reply = await bot.wait_for("message", check=check, timeout=300)
-                if reply.content.lower().strip() in ["yes", "y", "approve"]:
-                    await self.auto_approve()
-                    await owner.send("✅ User has been **approved** by Auto Judge.")
-                    return
-                else:
-                    await owner.send("❌ Approval **denied** by owner.")
-            except asyncio.TimeoutError:
-                await owner.send("⏰ No reply received. Auto Judge cancelled.")
-        except Exception as e:
-            print(f"Failed to DM owner: {e}")
-            await self.channel.send("⚠️ Could not DM owner.")
-
-        await self.channel.send("**Staff review needed.** Ticket remains open.")
-
-    async def auto_approve(self):
-        guild = self.channel.guild
-        cfg = get_guild_config(guild.id)
-        unverified = guild.get_role(cfg["unverified_role"])
-        role = guild.get_role(cfg["male_role"]) if self.gender == "male" else guild.get_role(cfg["female_role"])
-
-        if unverified and unverified in self.member.roles:
-            await self.member.remove_roles(unverified)
-        if role:
-            await self.member.add_roles(role)
-
-        try:
-            await self.member.send("✅ You passed the Auto Judge! Welcome to the server 🔥")
-        except:
-            pass
-
-        await log_action(guild, "🤖 Auto Judge Approved", 
-                        f"{self.member.mention} approved by Grok Auto Judge (Score: {sum(self.scores)*2:.0f}/100)", 
-                        color=0x00FF00)
-        await save_ticket_transcript(self.channel, guild, reason="Auto Judge Approved")
-        await remove_from_verification(self.member.id, guild.id)
-        await self.channel.delete()
+        print("✅ Gemini client initialized successfully (free tier)")
+    except Exception as e:
+        print(f"❌ Gemini setup failed: {e}")
+        gemini_client = None
+else:
+    print("⚠️ WARNING: GEMINI_API_KEY is not set in Railway Variables!")
+    print("   Add it in Railway → Variables → GEMINI_API_KEY")
+    gemini_client = None
 
 # =========================
 # TIMER + REST OF YOUR ORIGINAL CODE
