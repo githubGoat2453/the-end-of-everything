@@ -2267,6 +2267,9 @@ async def on_ready():
     await load_config()
     await load_staff_stats()
 
+            await init_additional_tables()
+
+
     for guild in bot.guilds:
         await ensure_config(guild)
         await ensure_control_room(guild)
@@ -2279,6 +2282,8 @@ async def on_ready():
 
     bot.loop.create_task(staff_inactivity_check())
     bot.loop.create_task(daily_summary())
+    bot.loop.create_task(ticket_timeout_checker())
+
 
     print(f"Logged in as {bot.user}")
     print(f"Loaded config: {config}")
@@ -2286,5 +2291,144 @@ async def on_ready():
 
 # =========================
 # RUN
+
+# =========================
+# Additional features added on 2026-04-10
+# =========================
+
+# Risk scoring function for new accounts
+def calculate_risk(member):
+    score = 0
+    reasons = []
+    account_age_days = (discord.utils.utcnow() - member.created_at).days
+    if account_age_days < 7:
+        score += 30
+        reasons.append("New account")
+    if not member.avatar:
+        score += 10
+        reasons.append("No avatar")
+    if member.name.isdigit():
+        score += 15
+        reasons.append("Suspicious username")
+    return score, reasons
+
+
+# Ticket status tracker
+def set_ticket_status(channel_id, status):
+    if channel_id not in ticket_tracking:
+        ticket_tracking[channel_id] = {}
+    ticket_tracking[channel_id]['status'] = status
+
+
+# Additional database tables for per-guild requirements and notes
+async def init_additional_tables():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS requirements_guild (
+                guild_id INTEGER,
+                gender TEXT,
+                text TEXT,
+                PRIMARY KEY (guild_id, gender)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS notes (
+                guild_id INTEGER,
+                user_id INTEGER,
+                note TEXT
+            )
+        """)
+        await db.commit()
+
+async def set_requirement_guild(guild_id, gender, text):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO requirements_guild (guild_id, gender, text) VALUES (?, ?, ?)",
+            (guild_id, gender, text)
+        )
+        await db.commit()
+
+
+# Ticket timeout checker to auto-close inactive tickets
+a
+# Risk scoring function for new accounts
+def calculate_risk(member):
+    score = 0
+    reasons = []
+    account_age_days = (discord.utils.utcnow() - member.created_at).days
+    if account_age_days < 7:
+        score += 30
+        reasons.append("New account")
+    if not member.avatar:
+        score += 10
+        reasons.append("No avatar")
+    if member.name.isdigit():
+        score += 15
+        reasons.append("Suspicious username")
+    return score, reasons
+
+# Ticket status tracker
+def set_ticket_status(channel_id, status):
+    if channel_id not in ticket_tracking:
+        ticket_tracking[channel_id] = {}
+    ticket_tracking[channel_id]['status'] = status
+
+# Additional database tables for per-guild requirements and notes
+async def init_additional_tables():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS requirements_guild (
+                guild_id INTEGER,
+                gender TEXT,
+                text TEXT,
+                PRIMARY KEY (guild_id, gender)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS notes (
+                guild_id INTEGER,
+                user_id INTEGER,
+                note TEXT
+            )
+        """)
+        await db.commit()
+
+sync def ticket_timeout_checker():
+    while True:
+        now = time.time()
+        for channel_id, data in list(ticket_tracking.items()):
+            created_ts = data.get('created')
+            # expire after 15 minutes of inactivity
+            if created_ts and now - created_ts > 900:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    try:
+                        await channel.send("\u23f0 Ticket expired due to inactivity.")
+                        await channel.delete()
+                    except:
+                        pass
+        await asyncio.sleep(60)
+
+
+# Notes command to retrieve notes stored in the notes table
+@bot.command()
+async def notes(ctx, user: discord.Member):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT note FROM notes WHERE guild_id=? AND user_id=?",
+            (ctx.guild.id, user.id)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    if not rows:
+        await ctx.send("No notes.")
+    else:
+        await ctx.send("\n".join([row[0] for row in rows]))
+
+
+# Simple stats command for approved/denied counts
+@bot.command()
+async def stats(ctx):
+    s = get_daily_stats(ctx.guild.id)
+    await ctx.send(f"Approved: {s['approved']} | Denied: {s['denied']}")
 # =========================
 bot.run(os.getenv("TOKEN"))
