@@ -6,21 +6,27 @@ import asyncio
 import time
 from collections import defaultdict
 
-# === GROK AI SETUP - FIXED ===
-from openai import AsyncOpenAI   # ← This was missing
+# ========================
+# SAFE GROK CLIENT SETUP
+# ========================
+from openai import AsyncOpenAI
 
-# Initialize Grok client safely
+grok_client = None
 grok_api_key = os.getenv("GROK_API_KEY")
-if not grok_api_key:
-    print("❌ WARNING: GROK_API_KEY is not set in environment variables!")
-    grok_client = None
+
+if grok_api_key:
+    try:
+        grok_client = AsyncOpenAI(
+            api_key=grok_api_key,
+            base_url="https://api.x.ai/v1"
+        )
+        print("✅ Grok client initialized successfully (using grok-4)")
+    except Exception as e:
+        print(f"❌ Failed to initialize Grok client: {e}")
+        grok_client = None
 else:
-    grok_client = AsyncOpenAI(
-        api_key=grok_api_key,
-        base_url="https://api.x.ai/v1"
-    )
-    print("✅ Grok client initialized successfully with grok-4")
-# ============================
+    print("⚠️  WARNING: GROK_API_KEY environment variable is not set!")
+    print("   Auto Judge will not work until you add the key in Railway Variables.")
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=".", intents=intents)
