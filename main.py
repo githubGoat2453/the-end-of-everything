@@ -5,13 +5,22 @@ import aiosqlite
 import asyncio
 import time
 from collections import defaultdict
-grok_client = AsyncOpenAI(
-    api_key=os.getenv("GROK_API_KEY"),
-    base_url="https://api.x.ai/v1"
-)
 
-# Quick test on startup
-print("✅ Grok client initialized with model grok-4")
+# === GROK AI SETUP - FIXED ===
+from openai import AsyncOpenAI   # ← This was missing
+
+# Initialize Grok client safely
+grok_api_key = os.getenv("GROK_API_KEY")
+if not grok_api_key:
+    print("❌ WARNING: GROK_API_KEY is not set in environment variables!")
+    grok_client = None
+else:
+    grok_client = AsyncOpenAI(
+        api_key=grok_api_key,
+        base_url="https://api.x.ai/v1"
+    )
+    print("✅ Grok client initialized successfully with grok-4")
+# ============================
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=".", intents=intents)
