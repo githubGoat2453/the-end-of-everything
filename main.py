@@ -5,12 +5,13 @@ import aiosqlite
 import asyncio
 import time
 from collections import defaultdict
-from openai import AsyncOpenAI
-
 grok_client = AsyncOpenAI(
     api_key=os.getenv("GROK_API_KEY"),
     base_url="https://api.x.ai/v1"
-) 
+)
+
+# Quick test on startup
+print("✅ Grok client initialized with model grok-4")
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=".", intents=intents)
@@ -978,23 +979,6 @@ class TicketControls(discord.ui.View):
         await save_staff_stats(interaction.guild.id, interaction.user.id)
 
 
-    # === AUTO JUDGE BUTTON (correctly inside TicketControls class) ===
-    @discord.ui.button(label="Auto Judge 🔍", style=discord.ButtonStyle.primary, emoji="🔍", row=1)
-    async def auto_judge(self, interaction, button):
-        if not self.is_staff(interaction):
-            return await interaction.response.send_message("Staff only", ephemeral=True)
-
-        await interaction.response.send_message("🔍 Starting Strict Grok Auto Judge with image analysis...", ephemeral=True)
-
-        member = interaction.guild.get_member(self.user_id)
-        if not member:
-            return await interaction.response.send_message("User not found.", ephemeral=True)
-
-        judge = AutoJudge(interaction.channel, member, self.gender)
-        bot.loop.create_task(judge.start())
-        
-        add_staff_stat(interaction.guild.id, interaction.user.id, "automation_runs", 1)
-        await save_staff_stats(interaction.guild.id, interaction.user.id)
 
 
     # === AUTO JUDGE BUTTON (correctly inside TicketControls class) ===
@@ -1016,9 +1000,12 @@ class TicketControls(discord.ui.View):
 # =========================
 # AUTO JUDGE CLASS
 # =========================
+# =========================
+# UPDATED GROK AUTO JUDGE - Full Owner DM Report
+# =========================
 class AutoJudge:
     QUESTIONS = [
-        "1️⃣ Who invited you to this server? (username or how you found it)",
+        "1️⃣ Who invited you here or how did you find this server?",
         "2️⃣ Do you know anyone in this server right now? If yes, who?",
         "3️⃣ Why do you want to join this server?",
         "4️⃣ Have you been in any other similar servers before?",
@@ -1034,118 +1021,164 @@ class AutoJudge:
         self.channel = channel
         self.member = member
         self.gender = gender
-        self.answers = []
+        self.history = []      # For Grok conversation memory
+        self.answers = []      # Stores user's raw answers for report
         self.scores = []
-        self.response_times = []
+        self.q_index = 0
 
     async def analyze_image(self, attachment):
         try:
-            response = await grok_client.chat.completions.create(
+            resp = await grok_client.chat.completions.create(
                 model="grok-2-vision",
                 messages=[{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Strict verification judge. Is this money/balance screenshot real or fake/edited/suspicious? Be direct and harsh."},
+                        {"type": "text", "text": "Be direct and harsh. Is this money/balance screenshot real or fake/edited/suspicious? Look for bad editing, low quality, wrong fonts, weird shadows, etc."},
                         {"type": "image_url", "image_url": {"url": attachment.url}}
                     ]
                 }],
-                max_tokens=150,
-                temperature=0.5
+                max_tokens=200,
+                temperature=0.7
             )
-            return response.choices[0].message.content.strip()
-        except Exception:
-            return "⚠️ Could not analyze the image."
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            print("Image analysis error:", e)
+            return "⚠️ Couldn't analyze the image properly."
 
-    async def get_grok_reply(self, question, answer, image_analysis=""):
+    async def get_grok_reply(self, user_message):
         try:
-            prompt = f"Question: {question}\nUser Answer: {answer}\n{image_analysis}\nBe very strict, short, and call out low effort or suspicious answers."
-            response = await grok_client.chat.completions.create(
-                model="grok-beta",
-                messages=[{"role": "system", "content": "Strict verification judge."}, {"role": "user", "content": prompt}],
-                max_tokens=80,
-                temperature=0.6
+            messages = [
+                {"role": "system", "content": 
+                    "You are Grok, a chill but strict and savage verification judge. "
+                    "Talk naturally like a real person. Use emojis. "
+                    "If the answer is weak, short, or suspicious, call it out and debate them. "
+                    "Respond to everything the user says. Don't repeat yourself."
+                }
+            ]
+
+            for q, a in self.history[-10:]:
+                messages.append({"role": "user", "content": q})
+                messages.append({"role": "assistant", "content": a})
+
+            messages.append({"role": "user", "content": user_message})
+
+            resp = await grok_client.chat.completions.create(
+                model="grok-4",
+                messages=messages,
+                max_tokens=170,
+                temperature=0.90
             )
-            return response.choices[0].message.content.strip()
-        except Exception:
-            return "Hmm... that's not very convincing."
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            print("Grok reply error:", e)
+            return "Bro... that's weak 💀 Give a real answer."
 
     async def start(self):
-        await self.channel.send(f"🔍 **Strict Auto Judge Started** for {self.member.mention}\nAnswer honestly.")
+        await self.channel.send(f"🔍 **Grok Auto Judge Started** — {self.member.mention}\nAnswer properly or get called out 🔥")
 
-        for i, q in enumerate(self.QUESTIONS):
-            await self.channel.send(f"**Question {i+1}/10**\n{q}")
+        await self.channel.send(self.QUESTIONS[0])
 
+        while self.q_index < len(self.QUESTIONS):
             def check(m):
                 return m.author == self.member and m.channel == self.channel
 
             try:
-                q_start = time.time()
-                msg = await bot.wait_for("message", check=check, timeout=180)
-                rt = time.time() - q_start
+                msg = await bot.wait_for("message", check=check, timeout=300)
             except asyncio.TimeoutError:
-                await self.channel.send("⏰ You took too long. Auto Judge ended.")
-                return await self.finish(low_score=True)
+                await self.channel.send("⏰ You took too long. Ending Auto Judge.")
+                return await self.finish()
 
+            if msg.content.strip().lower() == "next question":
+                self.q_index += 1
+                if self.q_index < len(self.QUESTIONS):
+                    await self.channel.send(self.QUESTIONS[self.q_index])
+                continue
+
+            # Store answer for report
+            self.history.append((self.QUESTIONS[self.q_index], msg.content))
             self.answers.append(msg.content)
-            self.response_times.append(rt)
 
-            image_reply = ""
+            # Image detection
             if msg.attachments:
                 for att in msg.attachments:
                     if att.content_type and att.content_type.startswith("image"):
-                        image_reply = await self.analyze_image(att)
-                        await self.channel.send(f"📸 **Grok Image Analysis:** {image_reply}")
+                        analysis = await self.analyze_image(att)
+                        await self.channel.send(f"📸 **Grok Image Analysis:** {analysis}")
 
-            grok_reply = await self.get_grok_reply(q, msg.content, image_reply)
-            await self.channel.send(grok_reply)
+            # Grok's reply
+            reply = await self.get_grok_reply(msg.content)
+            await self.channel.send(reply)
 
-            score = self._score_answer(msg.content, rt, i, bool(msg.attachments))
+            # Score
+            score = self._score_answer(msg.content, bool(msg.attachments))
             self.scores.append(score)
 
-            await asyncio.sleep(1.4)
+            self.q_index += 1
+
+            if self.q_index < len(self.QUESTIONS):
+                await asyncio.sleep(1.5)
+                await self.channel.send(self.QUESTIONS[self.q_index])
 
         await self.finish()
 
-    def _score_answer(self, text, rt, idx, has_image):
+    def _score_answer(self, text, has_image):
         score = 5
         length = len(text.strip())
 
-        if length > 70: score += 5
-        elif length > 35: score += 2
+        if length > 70: score += 6
+        elif length > 35: score += 3
+        if has_image: score += 8
+        if "money" in text.lower() or has_image: score += 5
 
-        if rt < 8: score -= 5
-        if rt > 110: score += 2
-
-        if idx == 5:  # Money proof
-            if has_image: score += 8
-            else: score -= 10
-
+        if length < 15 or any(w in text.lower() for w in ["idk", "anything", "nothing", "lol", "lmao", "haha"]):
+            score -= 9
         if any(w in text.lower() for w in ["nitro", "free", "raid", "bot", "automation"]):
-            score -= 8
+            score -= 10
 
         return max(0, min(10, score))
 
-    async def finish(self, low_score=False):
+    async def finish(self):
         total = sum(self.scores) * 2
         guild = self.channel.guild
         owner = guild.owner
 
-        embed = discord.Embed(
-            title="🔍 Auto Judge Final Report",
-            description=f"**User:** {self.member.mention}\n**Gender:** {self.gender.capitalize()}\n**Score:** `{total:.0f}/100`",
-            color=0x00FF00 if total >= 78 else 0xFF0000
+        # Full detailed report embed
+        report = discord.Embed(
+            title="🔍 Auto Judge Full Report",
+            description=f"**User:** {self.member.mention} (`{self.member.id}`)\n"
+                        f"**Gender:** {self.gender.capitalize()}\n"
+                        f"**Final Score:** `{total:.0f}/100`",
+            color=0x00FF00 if total >= 75 else 0xFF0000
         )
 
-        for i, (q, a) in enumerate(zip(self.QUESTIONS, self.answers)):
-            embed.add_field(name=q[:50] + "...", value=a[:250] or "[No answer]", inline=False)
+        # Add all questions and answers
+        for i, (q, a) in enumerate(zip(self.QUESTIONS, self.answers), 1):
+            answer_text = a[:700] if a else "[No answer provided]"
+            report.add_field(
+                name=f"Q{i}: {q[:90]}...",
+                value=answer_text,
+                inline=False
+            )
 
-        embed.add_field(name="Verdict", value="Auto-Approve Possible" if total >= 78 else "Staff Review Required", inline=False)
+        report.add_field(
+            name="Verdict",
+            value="✅ **Auto-Approve Recommended**" if total >= 75 else "❌ **Staff Review Required**",
+            inline=False
+        )
+        report.set_footer(text="Grok Auto Judge • Always sent to owner")
 
+        # ALWAYS DM the owner
         try:
-            dm = embed.copy()
-            dm.title = f"Auto Judge Approval Request — {self.member}"
-            dm.description += "\n\nReply with **yes** to approve or **no** to reject."
-            await owner.send(embed=dm)
+            await owner.send(embed=report)
+
+            # Ask for decision
+            confirm = discord.Embed(
+                title="Auto Judge Approval Request",
+                description=f"**User:** {self.member.mention}\n**Score:** `{total:.0f}/100`\n\n"
+                            f"Reply with **yes** to approve or **no** to reject.",
+                color=0x00FF00 if total >= 75 else 0xFF0000
+            )
+            await owner.send(embed=confirm)
 
             def check(m):
                 return m.author == owner and m.guild is None
@@ -1154,17 +1187,17 @@ class AutoJudge:
                 reply = await bot.wait_for("message", check=check, timeout=300)
                 if reply.content.lower().strip() in ["yes", "y", "approve"]:
                     await self.auto_approve()
-                    await owner.send("✅ User auto-approved.")
+                    await owner.send("✅ User has been **approved** by Auto Judge.")
                     return
                 else:
-                    await owner.send("❌ Owner denied.")
+                    await owner.send("❌ Approval **denied** by owner.")
             except asyncio.TimeoutError:
-                await owner.send("⏰ No reply. Cancelled.")
-        except:
-            pass
+                await owner.send("⏰ No reply received. Auto Judge cancelled.")
+        except Exception as e:
+            print(f"Failed to DM owner: {e}")
+            await self.channel.send("⚠️ Could not DM owner.")
 
-        await self.channel.send(embed=embed)
-        await self.channel.send("**Staff review required.** Ticket stays open.")
+        await self.channel.send("**Staff review needed.** Ticket remains open.")
 
     async def auto_approve(self):
         guild = self.channel.guild
@@ -1178,15 +1211,16 @@ class AutoJudge:
             await self.member.add_roles(role)
 
         try:
-            await self.member.send("✅ You have been automatically approved by Auto Judge!")
+            await self.member.send("✅ You passed the Auto Judge! Welcome to the server 🔥")
         except:
             pass
 
-        await log_action(guild, "🤖 Auto Judge Approved", f"{self.member.mention} auto-approved (Score: {sum(self.scores)*2:.0f}/100) after owner confirmation", color=0x00FF00)
-        await save_ticket_transcript(self.channel, guild, reason="Auto Judge Approved (Owner Confirmed)")
+        await log_action(guild, "🤖 Auto Judge Approved", 
+                        f"{self.member.mention} approved by Grok Auto Judge (Score: {sum(self.scores)*2:.0f}/100)", 
+                        color=0x00FF00)
+        await save_ticket_transcript(self.channel, guild, reason="Auto Judge Approved")
         await remove_from_verification(self.member.id, guild.id)
         await self.channel.delete()
-
 
 # =========================
 # TIMER + REST OF YOUR ORIGINAL CODE
