@@ -993,12 +993,32 @@ class TicketControls(discord.ui.View):
         judge = AutoJudge(interaction.channel, member, self.gender)
         bot.loop.create_task(judge.start())
         
+        add_staff_stat(interaction.guild.id, interaction.user.id, "automation_runs", 1)
+        await save_staff_stats(interaction.guild.id, interaction.user.id)
+
+
+    # === AUTO JUDGE BUTTON (correctly inside TicketControls class) ===
+    @discord.ui.button(label="Auto Judge 🔍", style=discord.ButtonStyle.primary, emoji="🔍", row=1)
+    async def auto_judge(self, interaction, button):
+        if not self.is_staff(interaction):
+            return await interaction.response.send_message("Staff only", ephemeral=True)
+
+        await interaction.response.send_message("🔍 Starting Strict Grok Auto Judge with image analysis...", ephemeral=True)
+
+        member = interaction.guild.get_member(self.user_id)
+        if not member:
+            return await interaction.response.send_message("User not found.", ephemeral=True)
+
+        judge = AutoJudge(interaction.channel, member, self.gender)
+        bot.loop.create_task(judge.start())
+
+
 # =========================
-# CLEAN & PROPER GROK AUTO JUDGE
+# AUTO JUDGE CLASS
 # =========================
 class AutoJudge:
     QUESTIONS = [
-        "1️⃣ Who invited you here or how did you find this server?",
+        "1️⃣ Who invited you to this server? (username or how you found it)",
         "2️⃣ Do you know anyone in this server right now? If yes, who?",
         "3️⃣ Why do you want to join this server?",
         "4️⃣ Have you been in any other similar servers before?",
@@ -1014,111 +1034,98 @@ class AutoJudge:
         self.channel = channel
         self.member = member
         self.gender = gender
-        self.history = []           # For real conversation memory
+        self.answers = []
         self.scores = []
-        self.q_index = 0
+        self.response_times = []
 
     async def analyze_image(self, attachment):
         try:
-            resp = await grok_client.chat.completions.create(
+            response = await grok_client.chat.completions.create(
                 model="grok-2-vision",
                 messages=[{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Be harsh. Is this money/balance screenshot real or fake/edited/suspicious? Look for bad editing, low quality, wrong fonts, etc. Roast if it's fake."},
+                        {"type": "text", "text": "Strict verification judge. Is this money/balance screenshot real or fake/edited/suspicious? Be direct and harsh."},
                         {"type": "image_url", "image_url": {"url": attachment.url}}
                     ]
                 }],
-                max_tokens=180,
-                temperature=0.7
+                max_tokens=150,
+                temperature=0.5
             )
-            return resp.choices[0].message.content.strip()
-        except:
-            return "⚠️ Couldn't analyze the image properly."
+            return response.choices[0].message.content.strip()
+        except Exception:
+            return "⚠️ Could not analyze the image."
 
-    async def get_grok_reply(self, user_message):
+    async def get_grok_reply(self, question, answer, image_analysis=""):
         try:
-            messages = [
-                {"role": "system", "content": 
-                    "You are Grok. You are a chill but extremely strict and savage verification judge. "
-                    "Talk naturally, use emojis, be sarcastic and mean when the user gives dumb or low-effort answers. "
-                    "Debate them. Call them out. Don't repeat yourself. Respond to everything they say."
-                }
-            ]
-
-            # Add conversation history
-            for q, a in self.history[-8:]:
-                messages.append({"role": "user", "content": q})
-                messages.append({"role": "assistant", "content": a})
-
-            messages.append({"role": "user", "content": user_message})
-
-            resp = await grok_client.chat.completions.create(
+            prompt = f"Question: {question}\nUser Answer: {answer}\n{image_analysis}\nBe very strict, short, and call out low effort or suspicious answers."
+            response = await grok_client.chat.completions.create(
                 model="grok-beta",
-                messages=messages,
-                max_tokens=160,
-                temperature=0.9
+                messages=[{"role": "system", "content": "Strict verification judge."}, {"role": "user", "content": prompt}],
+                max_tokens=80,
+                temperature=0.6
             )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            print("Grok reply error:", e)
-            return "Bro... that's actually braindead. Try again with a real answer 💀"
+            return response.choices[0].message.content.strip()
+        except Exception:
+            return "Hmm... that's not very convincing."
 
     async def start(self):
-        await self.channel.send(f"🔍 **Grok Auto Judge Started** — {self.member.mention}\nTalk to me properly or get roasted 🔥")
+        await self.channel.send(f"🔍 **Strict Auto Judge Started** for {self.member.mention}\nAnswer honestly.")
 
-        await self.channel.send(self.QUESTIONS[0])
+        for i, q in enumerate(self.QUESTIONS):
+            await self.channel.send(f"**Question {i+1}/10**\n{q}")
 
-        while self.q_index < len(self.QUESTIONS):
             def check(m):
                 return m.author == self.member and m.channel == self.channel
 
             try:
-                msg = await bot.wait_for("message", check=check, timeout=300)
+                q_start = time.time()
+                msg = await bot.wait_for("message", check=check, timeout=180)
+                rt = time.time() - q_start
             except asyncio.TimeoutError:
-                await self.channel.send("⏰ Too slow. Ending judge.")
-                return await self.finish()
+                await self.channel.send("⏰ You took too long. Auto Judge ended.")
+                return await self.finish(low_score=True)
 
-            if msg.content.strip().lower() == "next question":
-                self.q_index += 1
-                if self.q_index < len(self.QUESTIONS):
-                    await self.channel.send(self.QUESTIONS[self.q_index])
-                continue
+            self.answers.append(msg.content)
+            self.response_times.append(rt)
 
-            self.history.append((self.QUESTIONS[self.q_index], msg.content))
-
-            # Image detection
+            image_reply = ""
             if msg.attachments:
                 for att in msg.attachments:
                     if att.content_type and att.content_type.startswith("image"):
-                        analysis = await self.analyze_image(att)
-                        await self.channel.send(f"📸 **Grok Image Analysis:** {analysis}")
+                        image_reply = await self.analyze_image(att)
+                        await self.channel.send(f"📸 **Grok Image Analysis:** {image_reply}")
 
-            # Real Grok reply
-            reply = await self.get_grok_reply(msg.content)
-            await self.channel.send(reply)
+            grok_reply = await self.get_grok_reply(q, msg.content, image_reply)
+            await self.channel.send(grok_reply)
 
-            # Score
-            score = self._score_answer(msg.content, bool(msg.attachments))
+            score = self._score_answer(msg.content, rt, i, bool(msg.attachments))
             self.scores.append(score)
 
-            self.q_index += 1
-            if self.q_index < len(self.QUESTIONS):
-                await asyncio.sleep(1.5)
-                await self.channel.send(self.QUESTIONS[self.q_index])
+            await asyncio.sleep(1.4)
 
         await self.finish()
 
-    def _score_answer(self, text, has_image):
+    def _score_answer(self, text, rt, idx, has_image):
         score = 5
-        if len(text) > 70: score += 6
-        elif len(text) > 35: score += 3
-        if has_image: score += 8
-        if any(w in text.lower() for w in ["nitro","free","raid","bot","idk","anything"]): 
-            score -= 9
+        length = len(text.strip())
+
+        if length > 70: score += 5
+        elif length > 35: score += 2
+
+        if rt < 8: score -= 5
+        if rt > 110: score += 2
+
+        if idx == 5:  # Money proof
+            if has_image: score += 8
+            else: score -= 10
+
+        if any(w in text.lower() for w in ["nitro", "free", "raid", "bot", "automation"]):
+            score -= 8
+
         return max(0, min(10, score))
 
-    async def finish(self):
+    async def finish(self, low_score=False):
         total = sum(self.scores) * 2
         guild = self.channel.guild
         owner = guild.owner
@@ -1126,28 +1133,38 @@ class AutoJudge:
         embed = discord.Embed(
             title="🔍 Auto Judge Final Report",
             description=f"**User:** {self.member.mention}\n**Gender:** {self.gender.capitalize()}\n**Score:** `{total:.0f}/100`",
-            color=0x00FF00 if total >= 75 else 0xFF0000
+            color=0x00FF00 if total >= 78 else 0xFF0000
         )
-        await self.channel.send(embed=embed)
 
-        if total >= 75:
-            await self.channel.send("✅ Score is good. DMing owner for approval...")
+        for i, (q, a) in enumerate(zip(self.QUESTIONS, self.answers)):
+            embed.add_field(name=q[:50] + "...", value=a[:250] or "[No answer]", inline=False)
+
+        embed.add_field(name="Verdict", value="Auto-Approve Possible" if total >= 78 else "Staff Review Required", inline=False)
+
+        try:
+            dm = embed.copy()
+            dm.title = f"Auto Judge Approval Request — {self.member}"
+            dm.description += "\n\nReply with **yes** to approve or **no** to reject."
+            await owner.send(embed=dm)
+
+            def check(m):
+                return m.author == owner and m.guild is None
+
             try:
-                dm = embed.copy()
-                dm.description += "\n\nReply **yes** to approve or **no** to deny."
-                await owner.send(embed=dm)
-
-                def check(m):
-                    return m.author == owner and m.guild is None
-
                 reply = await bot.wait_for("message", check=check, timeout=300)
                 if reply.content.lower().strip() in ["yes", "y", "approve"]:
                     await self.auto_approve()
+                    await owner.send("✅ User auto-approved.")
                     return
-            except:
-                pass
+                else:
+                    await owner.send("❌ Owner denied.")
+            except asyncio.TimeoutError:
+                await owner.send("⏰ No reply. Cancelled.")
+        except:
+            pass
 
-        await self.channel.send("**Staff review needed.**")
+        await self.channel.send(embed=embed)
+        await self.channel.send("**Staff review required.** Ticket stays open.")
 
     async def auto_approve(self):
         guild = self.channel.guild
@@ -1161,14 +1178,16 @@ class AutoJudge:
             await self.member.add_roles(role)
 
         try:
-            await self.member.send("✅ You passed Auto Judge. Welcome 🔥")
+            await self.member.send("✅ You have been automatically approved by Auto Judge!")
         except:
             pass
 
-        await log_action(guild, "🤖 Auto Judge Approved", f"{self.member.mention} approved (Score: {sum(self.scores)*2:.0f}/100)", color=0x00FF00)
-        await save_ticket_transcript(self.channel, guild, reason="Auto Judge Approved")
+        await log_action(guild, "🤖 Auto Judge Approved", f"{self.member.mention} auto-approved (Score: {sum(self.scores)*2:.0f}/100) after owner confirmation", color=0x00FF00)
+        await save_ticket_transcript(self.channel, guild, reason="Auto Judge Approved (Owner Confirmed)")
         await remove_from_verification(self.member.id, guild.id)
         await self.channel.delete()
+
+
 # =========================
 # TIMER + REST OF YOUR ORIGINAL CODE
 # =========================
