@@ -5,6 +5,12 @@ import aiosqlite
 import asyncio
 import time
 from collections import defaultdict
+from openai import AsyncOpenAI
+
+grok_client = AsyncOpenAI(
+    api_key=os.getenv("GROK_API_KEY"),
+    base_url="https://api.x.ai/v1"
+) 
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=".", intents=intents)
@@ -968,6 +974,204 @@ class TicketControls(discord.ui.View):
         await save_staff_stats(interaction.guild.id, interaction.user.id)
 
 
+        add_staff_stat(interaction.guild.id, interaction.user.id, "automation_runs", 1)
+        await save_staff_stats(interaction.guild.id, interaction.user.id)
+
+
+    # === AUTO JUDGE BUTTON (correctly inside TicketControls class) ===
+    @discord.ui.button(label="Auto Judge 🔍", style=discord.ButtonStyle.primary, emoji="🔍", row=1)
+    async def auto_judge(self, interaction, button):
+        if not self.is_staff(interaction):
+            return await interaction.response.send_message("Staff only", ephemeral=True)
+
+        await interaction.response.send_message("🔍 Starting Strict Grok Auto Judge with image analysis...", ephemeral=True)
+
+        member = interaction.guild.get_member(self.user_id)
+        if not member:
+            return await interaction.response.send_message("User not found.", ephemeral=True)
+
+        judge = AutoJudge(interaction.channel, member, self.gender)
+        bot.loop.create_task(judge.start())
+
+
+# =========================
+# AUTO JUDGE CLASS
+# =========================
+class AutoJudge:
+    QUESTIONS = [
+        "1️⃣ Who invited you to this server? (username or how you found it)",
+        "2️⃣ Do you know anyone in this server right now? If yes, who?",
+        "3️⃣ Why do you want to join this server?",
+        "4️⃣ Have you been in any other similar servers before?",
+        "5️⃣ What’s your main alias or username you use?",
+        "6️⃣ Can you send proof of money / balance right now? (screenshot or statement)",
+        "7️⃣ How long have you been using Discord?",
+        "8️⃣ What do you usually do in servers like this?",
+        "9️⃣ Are you a real person or using any automation? (be honest)",
+        "🔟 Anything else you want staff to know before we approve you?"
+    ]
+
+    def __init__(self, channel, member, gender):
+        self.channel = channel
+        self.member = member
+        self.gender = gender
+        self.answers = []
+        self.scores = []
+        self.response_times = []
+
+    async def analyze_image(self, attachment):
+        try:
+            response = await grok_client.chat.completions.create(
+                model="grok-2-vision",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Strict verification judge. Is this money/balance screenshot real or fake/edited/suspicious? Be direct and harsh."},
+                        {"type": "image_url", "image_url": {"url": attachment.url}}
+                    ]
+                }],
+                max_tokens=150,
+                temperature=0.5
+            )
+            return response.choices[0].message.content.strip()
+        except Exception:
+            return "⚠️ Could not analyze the image."
+
+    async def get_grok_reply(self, question, answer, image_analysis=""):
+        try:
+            prompt = f"Question: {question}\nUser Answer: {answer}\n{image_analysis}\nBe very strict, short, and call out low effort or suspicious answers."
+            response = await grok_client.chat.completions.create(
+                model="grok-beta",
+                messages=[{"role": "system", "content": "Strict verification judge."}, {"role": "user", "content": prompt}],
+                max_tokens=80,
+                temperature=0.6
+            )
+            return response.choices[0].message.content.strip()
+        except Exception:
+            return "Hmm... that's not very convincing."
+
+    async def start(self):
+        await self.channel.send(f"🔍 **Strict Auto Judge Started** for {self.member.mention}\nAnswer honestly.")
+
+        for i, q in enumerate(self.QUESTIONS):
+            await self.channel.send(f"**Question {i+1}/10**\n{q}")
+
+            def check(m):
+                return m.author == self.member and m.channel == self.channel
+
+            try:
+                q_start = time.time()
+                msg = await bot.wait_for("message", check=check, timeout=180)
+                rt = time.time() - q_start
+            except asyncio.TimeoutError:
+                await self.channel.send("⏰ You took too long. Auto Judge ended.")
+                return await self.finish(low_score=True)
+
+            self.answers.append(msg.content)
+            self.response_times.append(rt)
+
+            image_reply = ""
+            if msg.attachments:
+                for att in msg.attachments:
+                    if att.content_type and att.content_type.startswith("image"):
+                        image_reply = await self.analyze_image(att)
+                        await self.channel.send(f"📸 **Grok Image Analysis:** {image_reply}")
+
+            grok_reply = await self.get_grok_reply(q, msg.content, image_reply)
+            await self.channel.send(grok_reply)
+
+            score = self._score_answer(msg.content, rt, i, bool(msg.attachments))
+            self.scores.append(score)
+
+            await asyncio.sleep(1.4)
+
+        await self.finish()
+
+    def _score_answer(self, text, rt, idx, has_image):
+        score = 5
+        length = len(text.strip())
+
+        if length > 70: score += 5
+        elif length > 35: score += 2
+
+        if rt < 8: score -= 5
+        if rt > 110: score += 2
+
+        if idx == 5:  # Money proof
+            if has_image: score += 8
+            else: score -= 10
+
+        if any(w in text.lower() for w in ["nitro", "free", "raid", "bot", "automation"]):
+            score -= 8
+
+        return max(0, min(10, score))
+
+    async def finish(self, low_score=False):
+        total = sum(self.scores) * 2
+        guild = self.channel.guild
+        owner = guild.owner
+
+        embed = discord.Embed(
+            title="🔍 Auto Judge Final Report",
+            description=f"**User:** {self.member.mention}\n**Gender:** {self.gender.capitalize()}\n**Score:** `{total:.0f}/100`",
+            color=0x00FF00 if total >= 78 else 0xFF0000
+        )
+
+        for i, (q, a) in enumerate(zip(self.QUESTIONS, self.answers)):
+            embed.add_field(name=q[:50] + "...", value=a[:250] or "[No answer]", inline=False)
+
+        embed.add_field(name="Verdict", value="Auto-Approve Possible" if total >= 78 else "Staff Review Required", inline=False)
+
+        try:
+            dm = embed.copy()
+            dm.title = f"Auto Judge Approval Request — {self.member}"
+            dm.description += "\n\nReply with **yes** to approve or **no** to reject."
+            await owner.send(embed=dm)
+
+            def check(m):
+                return m.author == owner and m.guild is None
+
+            try:
+                reply = await bot.wait_for("message", check=check, timeout=300)
+                if reply.content.lower().strip() in ["yes", "y", "approve"]:
+                    await self.auto_approve()
+                    await owner.send("✅ User auto-approved.")
+                    return
+                else:
+                    await owner.send("❌ Owner denied.")
+            except asyncio.TimeoutError:
+                await owner.send("⏰ No reply. Cancelled.")
+        except:
+            pass
+
+        await self.channel.send(embed=embed)
+        await self.channel.send("**Staff review required.** Ticket stays open.")
+
+    async def auto_approve(self):
+        guild = self.channel.guild
+        cfg = get_guild_config(guild.id)
+        unverified = guild.get_role(cfg["unverified_role"])
+        role = guild.get_role(cfg["male_role"]) if self.gender == "male" else guild.get_role(cfg["female_role"])
+
+        if unverified and unverified in self.member.roles:
+            await self.member.remove_roles(unverified)
+        if role:
+            await self.member.add_roles(role)
+
+        try:
+            await self.member.send("✅ You have been automatically approved by Auto Judge!")
+        except:
+            pass
+
+        await log_action(guild, "🤖 Auto Judge Approved", f"{self.member.mention} auto-approved (Score: {sum(self.scores)*2:.0f}/100) after owner confirmation", color=0x00FF00)
+        await save_ticket_transcript(self.channel, guild, reason="Auto Judge Approved (Owner Confirmed)")
+        await remove_from_verification(self.member.id, guild.id)
+        await self.channel.delete()
+
+
+# =========================
+# TIMER + REST OF YOUR ORIGINAL CODE
+# =========================
 async def start_timer(channel, member, duration=600):
     end_time = time.time() + duration
     warned = False
@@ -1052,7 +1256,6 @@ async def auto_kick_if_unverified(member_id, guild_id, delay=600):
 # =========================
 async def ensure_config(guild):
     guild_cfg = get_guild_config(guild.id)
-
     if any(v is None for v in guild_cfg.values()):
         male = discord.utils.get(guild.roles, name="Male")
         female = discord.utils.get(guild.roles, name="Female")
@@ -1060,7 +1263,6 @@ async def ensure_config(guild):
         staff = discord.utils.get(guild.roles, name="Staff")
         category = discord.utils.get(guild.categories, name="Verification Tickets")
         log_channel = discord.utils.get(guild.text_channels, name="verification-logs")
-
         if all([male, female, unverified, staff, category, log_channel]):
             guild_cfg.update({
                 "log_channel": log_channel.id,
@@ -1071,7 +1273,6 @@ async def ensure_config(guild):
                 "staff_role": staff.id
             })
             await save_config_for_guild(guild.id)
-
             await log_action(
                 guild,
                 "🛠️ Config Auto-Repaired",
@@ -1616,7 +1817,7 @@ async def on_message_delete(message):
 
 
 # =========================
-# PROFESSIONAL ADMIN PANEL (Clean + Action Buttons + Ping)
+# PROFESSIONAL ADMIN PANEL
 # =========================
 class VerificationPanel(discord.ui.View):
     def __init__(self, guild, rows):
