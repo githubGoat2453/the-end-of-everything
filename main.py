@@ -1012,7 +1012,198 @@ class TicketControls(discord.ui.View):
         judge = AutoJudge(interaction.channel, member, self.gender)
         bot.loop.create_task(judge.start())
 
+# =========================
+# GEMINI AUTO JUDGE - Free Version
+# =========================
+class AutoJudge:
+    QUESTIONS = [
+        "1️⃣ Who invited you here or how did you find this server?",
+        "2️⃣ Do you know anyone in this server right now? If yes, who?",
+        "3️⃣ Why do you want to join this server?",
+        "4️⃣ Have you been in any other similar servers before?",
+        "5️⃣ What’s your main alias or username you use?",
+        "6️⃣ Can you send proof of money / balance right now? (screenshot or statement)",
+        "7️⃣ How long have you been using Discord?",
+        "8️⃣ What do you usually do in servers like this?",
+        "9️⃣ Are you a real person or using any automation? (be honest)",
+        "🔟 Anything else you want staff to know before we approve you?"
+    ]
 
+    def __init__(self, channel, member, gender):
+        self.channel = channel
+        self.member = member
+        self.gender = gender
+        self.history = []
+        self.answers = []
+        self.scores = []
+        self.q_index = 0
+
+    async def analyze_image(self, attachment):
+        if not gemini_client:
+            return "⚠️ AI is not available right now."
+        try:
+            resp = await gemini_client.chat.completions.create(
+                model="gemini-2.0-flash",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "You are a harsh verification judge. Is this money/balance screenshot real or fake/edited/suspicious? Look for bad editing, low quality, wrong fonts, weird shadows. Be direct and roast if it's fake. Use emojis."},
+                        {"type": "image_url", "image_url": {"url": attachment.url}}
+                    ]
+                }],
+                max_tokens=200,
+                temperature=0.75
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            print("Image analysis error:", e)
+            return "⚠️ Couldn't analyze the image properly."
+
+    async def get_grok_reply(self, user_message):
+        if not gemini_client:
+            return "Bro... the AI is not working right now 💀"
+        try:
+            messages = [
+                {"role": "system", "content": 
+                    "You are Grok, a chill but extremely savage and strict verification judge. "
+                    "Roast the user hard when they give weak answers. Call them dumb, slow, clown. "
+                    "Use emojis. Debate them. Respond to everything they say."
+                }
+            ]
+            for q, a in self.history[-10:]:
+                messages.append({"role": "user", "content": q})
+                messages.append({"role": "assistant", "content": a})
+            messages.append({"role": "user", "content": user_message})
+
+            resp = await gemini_client.chat.completions.create(
+                model="gemini-2.0-flash",
+                messages=messages,
+                max_tokens=170,
+                temperature=0.92
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            print("Gemini reply error:", e)
+            return "That's weak 💀 Give a real answer."
+
+    async def start(self):
+        await self.channel.send(f"🔍 **Auto Judge Started** — {self.member.mention}\nAnswer properly or get roasted 🔥")
+
+        await self.channel.send(self.QUESTIONS[0])
+
+        while self.q_index < len(self.QUESTIONS):
+            def check(m):
+                return m.author == self.member and m.channel == self.channel
+
+            try:
+                msg = await bot.wait_for("message", check=check, timeout=300)
+            except asyncio.TimeoutError:
+                await self.channel.send("⏰ Too slow. Ending judge.")
+                return await self.finish()
+
+            if msg.content.strip().lower() == "next question":
+                self.q_index += 1
+                if self.q_index < len(self.QUESTIONS):
+                    await self.channel.send(self.QUESTIONS[self.q_index])
+                continue
+
+            self.history.append((self.QUESTIONS[self.q_index], msg.content))
+            self.answers.append(msg.content)
+
+            if msg.attachments:
+                for att in msg.attachments:
+                    if att.content_type and att.content_type.startswith("image"):
+                        analysis = await self.analyze_image(att)
+                        await self.channel.send(f"📸 **Image Analysis:** {analysis}")
+
+            reply = await self.get_grok_reply(msg.content)
+            await self.channel.send(reply)
+
+            score = self._score_answer(msg.content, bool(msg.attachments))
+            self.scores.append(score)
+
+            self.q_index += 1
+
+            if self.q_index < len(self.QUESTIONS):
+                await asyncio.sleep(1.5)
+                await self.channel.send(self.QUESTIONS[self.q_index])
+
+        await self.finish()
+
+    def _score_answer(self, text, has_image):
+        score = 5
+        length = len(text.strip())
+        if length > 70: score += 6
+        elif length > 35: score += 3
+        if has_image: score += 8
+        if "money" in text.lower() or has_image: score += 5
+        if length < 15 or any(w in text.lower() for w in ["idk", "anything", "lol", "lmao"]):
+            score -= 9
+        return max(0, min(10, score))
+
+    async def finish(self):
+        total = sum(self.scores) * 2
+        guild = self.channel.guild
+        owner = guild.owner
+
+        report = discord.Embed(
+            title="🔍 Auto Judge Full Report",
+            description=f"**User:** {self.member.mention} (`{self.member.id}`)\n**Gender:** {self.gender.capitalize()}\n**Final Score:** `{total:.0f}/100`",
+            color=0x00FF00 if total >= 75 else 0xFF0000
+        )
+
+        for i, (q, a) in enumerate(zip(self.QUESTIONS, self.answers), 1):
+            answer_text = a[:700] if a else "[No answer]"
+            report.add_field(name=f"Q{i}: {q[:90]}...", value=answer_text, inline=False)
+
+        report.add_field(name="Verdict", value="✅ Auto-Approve Recommended" if total >= 75 else "❌ Staff Review Required", inline=False)
+
+        try:
+            await owner.send(embed=report)
+
+            confirm = discord.Embed(
+                title="Auto Judge Approval Request",
+                description=f"**User:** {self.member.mention}\n**Score:** `{total:.0f}/100`\n\nReply **yes** to approve or **no** to reject.",
+                color=0x00FF00 if total >= 75 else 0xFF0000
+            )
+            await owner.send(embed=confirm)
+
+            def check(m):
+                return m.author == owner and m.guild is None
+
+            reply = await bot.wait_for("message", check=check, timeout=300)
+            if reply.content.lower().strip() in ["yes", "y", "approve"]:
+                await self.auto_approve()
+                await owner.send("✅ User approved.")
+                return
+            else:
+                await owner.send("❌ Approval denied.")
+        except Exception as e:
+            print(f"DM error: {e}")
+
+        await self.channel.send("**Staff review needed.**")
+
+    async def auto_approve(self):
+        guild = self.channel.guild
+        cfg = get_guild_config(guild.id)
+        unverified = guild.get_role(cfg["unverified_role"])
+        role = guild.get_role(cfg["male_role"]) if self.gender == "male" else guild.get_role(cfg["female_role"])
+
+        if unverified and unverified in self.member.roles:
+            await self.member.remove_roles(unverified)
+        if role:
+            await self.member.add_roles(role)
+
+        try:
+            await self.member.send("✅ You passed Auto Judge! Welcome 🔥")
+        except:
+            pass
+
+        await log_action(guild, "🤖 Auto Judge Approved", 
+                        f"{self.member.mention} approved (Score: {sum(self.scores)*2:.0f}/100)", color=0x00FF00)
+        await save_ticket_transcript(self.channel, guild, reason="Auto Judge Approved")
+        await remove_from_verification(self.member.id, guild.id)
+        await self.channel.delete()
 # ========================
 # GOOGLE GEMINI SETUP (FREE)
 # ========================
