@@ -3089,12 +3089,14 @@ async def adminpanel(ctx):
 
     if not rows:
         await control_room.send(embed=discord.Embed(title="Control Room", description="✅ No active verifications.", color=0x57F287))
-        return await ctx.send(f"{ctx.author.mention} **Control Room updated.** No active verifications right now.", ephemeral=True)
+    else:
+        view = VerificationPanel(ctx.guild, rows)
+        await view.start(control_room)
 
-    view = VerificationPanel(ctx.guild, rows)
-    await view.start(control_room)
+    audit_view = AuditLogPanel(ctx.guild)
+    await audit_view.start(control_room)
 
-    await ctx.send(f"{ctx.author.mention} **Control Room opened.** Check `#control-room` for the categorized live moderation console.", ephemeral=True)
+    await ctx.send(f"{ctx.author.mention} **Control Room opened.** Verification console + audit console are now in `#control-room`.", ephemeral=True)
 
 # =========================
 # STAFF INACTIVITY CHECK
@@ -3696,6 +3698,561 @@ async def ticket_timeout_checker():
                     print(f"Ticket timeout error: {e}")
 
         await asyncio.sleep(30)
+
+
+
+
+# =========================
+# ADVANCED AUDIT ADD-ON
+# =========================
+AUDIT_PAGE_SIZE = 8
+AUDIT_TYPE_LABELS = {
+    "join": "User Joined",
+    "leave": "User Left",
+    "rejoin": "User Rejoined",
+    "nickname_change": "Nickname Change",
+    "username_change": "Username Change",
+    "avatar_change": "Avatar Change",
+    "role_added": "Role Added",
+    "role_removed": "Role Removed",
+    "permission_risk": "Permission Risk",
+    "channel_access": "Channel Access",
+    "invite_used": "Invite Used",
+    "invite_created": "Invite Created",
+    "invite_deleted": "Invite Deleted",
+    "ticket_created": "Ticket Created",
+    "ticket_lifecycle": "Ticket Lifecycle",
+    "ticket_inactivity": "Ticket Inactivity",
+    "ticket_attachment": "Ticket Attachment",
+    "ticket_delete": "Ticket Deleted",
+    "ticket_edit": "Ticket Edited",
+    "ticket_participant": "Ticket Participant",
+    "ticket_transfer": "Ticket Transfer",
+    "ticket_reopen": "Ticket Reopen",
+    "ticket_replay": "Ticket Replay",
+    "staff_heatmap": "Staff Heatmap",
+    "staff_shift": "Staff Shift",
+    "staff_approval_streak": "Approval Streak",
+    "staff_deny_streak": "Deny Streak",
+    "staff_ratio": "Staff Action Ratio",
+    "staff_response_delay": "Staff Response Delay",
+    "staff_override": "Staff Override",
+    "staff_claim_abuse": "Claim Abuse",
+    "staff_note_frequency": "Note Frequency",
+    "staff_proof_frequency": "Proof Frequency",
+    "keyword_hit": "Keyword Hit",
+    "link_history": "Link History",
+    "mention_history": "Mention History",
+    "reaction_audit": "Reaction Audit",
+    "spam_burst": "Spam Burst",
+    "copy_paste": "Copy Paste Pattern",
+    "message_length": "Message Length Trend",
+    "late_edit": "Late Edit",
+    "attachment_type": "Attachment Type",
+    "voice_proof": "Voice Proof",
+    "ban_evasion": "Ban Evasion Watch",
+    "alt_cluster": "Alt Cluster",
+    "suspicious_role_gain": "Suspicious Role Gain",
+    "manual_role_tamper": "Manual Role Tamper",
+    "channel_permission_change": "Channel Permission Change",
+    "emergency_mode": "Emergency Mode",
+    "mass_action": "Mass Action",
+    "shadow_mute": "Shadow Mute",
+    "blacklist_attempt": "Blacklist Rejoin Attempt",
+    "evidence_locker": "Evidence Locker",
+}
+AUDIT_TYPE_GROUPS = {
+    "User": ["join","leave","rejoin","nickname_change","username_change","avatar_change","role_added","role_removed","permission_risk","channel_access","invite_used"],
+    "Ticket": ["ticket_created","ticket_lifecycle","ticket_inactivity","ticket_attachment","ticket_delete","ticket_edit","ticket_participant","ticket_transfer","ticket_reopen","ticket_replay"],
+    "Staff": ["staff_heatmap","staff_shift","staff_approval_streak","staff_deny_streak","staff_ratio","staff_response_delay","staff_override","staff_claim_abuse","staff_note_frequency","staff_proof_frequency"],
+    "Message": ["keyword_hit","link_history","mention_history","reaction_audit","spam_burst","copy_paste","message_length","late_edit","attachment_type","voice_proof"],
+    "Security": ["ban_evasion","alt_cluster","suspicious_role_gain","manual_role_tamper","channel_permission_change","emergency_mode","mass_action","shadow_mute","blacklist_attempt","evidence_locker"],
+}
+AUDIT_KEYWORDS = ["nitro", "paypal", "cashapp", "crypto", "proof", "money", "ssn", "leak", "alt", "raid"]
+user_message_cache = defaultdict(list)
+audit_presence_cache = {}
+recent_join_cache = defaultdict(list)
+invite_cache = {}
+
+async def init_audit_tables():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER,
+            event_type TEXT,
+            category TEXT,
+            user_id INTEGER,
+            actor_id INTEGER,
+            channel_id INTEGER,
+            message_id INTEGER,
+            payload TEXT,
+            created_at INTEGER
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS identity_snapshots (
+            guild_id INTEGER,
+            user_id INTEGER,
+            snapshot_type TEXT,
+            value TEXT,
+            created_at INTEGER
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_audit_index (
+            guild_id INTEGER,
+            channel_id INTEGER,
+            ticket_user_id INTEGER,
+            event_type TEXT,
+            note TEXT,
+            created_at INTEGER
+        )
+        """)
+        await db.commit()
+
+async def audit_log(guild, event_type, payload, *, category="General", user_id=None, actor_id=None, channel_id=None, message_id=None):
+    ts = int(time.time())
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "INSERT INTO audit_events (guild_id, event_type, category, user_id, actor_id, channel_id, message_id, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (guild.id, event_type, category, user_id, actor_id, channel_id, message_id, str(payload)[:3500], ts)
+            )
+            await db.commit()
+    except Exception as e:
+        print(f"audit_log db error: {e}")
+
+    title = f"🧾 Audit • {AUDIT_TYPE_LABELS.get(event_type, event_type.replace('_',' ').title())}"
+    try:
+        await log_action(guild, title, str(payload)[:3000], color=0x2b2d31)
+    except Exception as e:
+        print(f"audit_log relay error: {e}")
+
+async def add_identity_snapshot(guild_id, user_id, snapshot_type, value):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT INTO identity_snapshots (guild_id, user_id, snapshot_type, value, created_at) VALUES (?, ?, ?, ?, ?)",
+            (guild_id, user_id, snapshot_type, str(value)[:2000], int(time.time()))
+        )
+        await db.commit()
+
+async def add_ticket_audit(guild_id, channel_id, ticket_user_id, event_type, note):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT INTO ticket_audit_index (guild_id, channel_id, ticket_user_id, event_type, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (guild_id, channel_id, ticket_user_id, event_type, str(note)[:2000], int(time.time()))
+        )
+        await db.commit()
+
+async def fetch_audit_events(guild_id, *, category=None, event_type=None, user_id=None, limit=25, offset=0):
+    clauses = ["guild_id=?"]
+    params = [guild_id]
+    if category:
+        clauses.append("category=?")
+        params.append(category)
+    if event_type:
+        clauses.append("event_type=?")
+        params.append(event_type)
+    if user_id:
+        clauses.append("user_id=?")
+        params.append(user_id)
+    query = f"SELECT event_type, category, user_id, actor_id, channel_id, payload, created_at FROM audit_events WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(query, params) as cursor:
+            return await cursor.fetchall()
+
+async def fetch_audit_counts(guild_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT event_type, COUNT(*) FROM audit_events WHERE guild_id=? GROUP BY event_type", (guild_id,)) as cursor:
+            rows = await cursor.fetchall()
+    return {etype: count for etype, count in rows}
+
+async def export_audit_text(guild_id, *, category=None, user_id=None, limit=500):
+    rows = await fetch_audit_events(guild_id, category=category, user_id=user_id, limit=limit)
+    out = []
+    for event_type, category, user_id, actor_id, channel_id, payload, created_at in rows:
+        out.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(created_at))}] {category}/{event_type}")
+        out.append(f"user={user_id} actor={actor_id} channel={channel_id}")
+        out.append(str(payload))
+        out.append("-"*60)
+    return "\n".join(out) if out else "No audit events found."
+
+class AuditLogPanel(discord.ui.View):
+    def __init__(self, guild, focus_user_id=None):
+        super().__init__(timeout=None)
+        self.guild = guild
+        self.focus_user_id = focus_user_id
+        self.category_names = ["Overview", "User", "Ticket", "Staff", "Message", "Security", "Raw"]
+        self.current_category = "Overview"
+        self.current_page = 0
+        self.message = None
+        self.update_task = None
+        self.last_counts = {}
+
+    async def refresh_counts(self):
+        self.last_counts = await fetch_audit_counts(self.guild.id)
+
+    def _group_total(self, category_name):
+        if category_name == "Overview":
+            return sum(self.last_counts.values())
+        if category_name == "Raw":
+            return sum(self.last_counts.values())
+        types = AUDIT_TYPE_GROUPS.get(category_name, [])
+        return sum(self.last_counts.get(t, 0) for t in types)
+
+    async def _category_rows(self):
+        if self.current_category in ("Overview", "Raw"):
+            return await fetch_audit_events(self.guild.id, user_id=self.focus_user_id, limit=AUDIT_PAGE_SIZE, offset=self.current_page * AUDIT_PAGE_SIZE)
+        types = AUDIT_TYPE_GROUPS.get(self.current_category, [])
+        collected = []
+        for t in types:
+            rows = await fetch_audit_events(self.guild.id, event_type=t, user_id=self.focus_user_id, limit=3)
+            collected.extend(rows)
+        collected.sort(key=lambda r: r[-1], reverse=True)
+        start = self.current_page * AUDIT_PAGE_SIZE
+        end = start + AUDIT_PAGE_SIZE
+        return collected[start:end]
+
+    async def get_embed(self):
+        await self.refresh_counts()
+        total = self._group_total(self.current_category)
+        embed = discord.Embed(
+            title=f"🧾 Audit Console — {self.current_category}",
+            description=f"**Total tracked events:** `{sum(self.last_counts.values())}`\n**Current bucket:** `{total}`",
+            color=0x5865F2
+        )
+        if self.focus_user_id:
+            embed.add_field(name="Focused User", value=f"<@{self.focus_user_id}> (`{self.focus_user_id}`)", inline=False)
+        # Summary blocks
+        if self.current_category == "Overview":
+            for name in ["User", "Ticket", "Staff", "Message", "Security"]:
+                embed.add_field(name=name, value=str(self._group_total(name)), inline=True)
+            counts_sorted = sorted(self.last_counts.items(), key=lambda x: x[1], reverse=True)[:15]
+            if counts_sorted:
+                embed.add_field(
+                    name="Top Event Types",
+                    value="\n".join(f"• {AUDIT_TYPE_LABELS.get(k,k)} — `{v}`" for k, v in counts_sorted),
+                    inline=False
+                )
+        rows = await self._category_rows()
+        if rows:
+            for idx, (event_type, category, user_id, actor_id, channel_id, payload, created_at) in enumerate(rows, 1):
+                preview = str(payload)
+                if len(preview) > 240:
+                    preview = preview[:237] + "..."
+                stamp = f"<t:{created_at}:R>"
+                header = f"{idx}. {AUDIT_TYPE_LABELS.get(event_type, event_type)}"
+                body = f"{preview}\n`u:{user_id}` `a:{actor_id}` `c:{channel_id}` • {stamp}"
+                embed.add_field(name=header, value=body, inline=False)
+        else:
+            embed.add_field(name="No Events", value="Nothing recorded in this category yet.", inline=False)
+        embed.set_footer(text=f"Category {self.current_category} • Page {self.current_page + 1}")
+        return embed
+
+    async def start(self, channel):
+        self.message = await channel.send(embed=await self.get_embed(), view=self)
+        self.update_task = bot.loop.create_task(self.live_update())
+
+    async def live_update(self):
+        while not self.is_finished():
+            try:
+                await asyncio.sleep(15)
+                if self.message:
+                    await self.message.edit(embed=await self.get_embed(), view=self)
+            except Exception:
+                break
+
+    async def _switch(self, interaction, category):
+        self.current_category = category
+        self.current_page = 0
+        await interaction.response.edit_message(embed=await self.get_embed(), view=self)
+
+    @discord.ui.button(label="Overview", style=discord.ButtonStyle.primary, row=0)
+    async def overview_btn(self, interaction, button):
+        await self._switch(interaction, "Overview")
+
+    @discord.ui.button(label="User", style=discord.ButtonStyle.secondary, row=0)
+    async def user_btn(self, interaction, button):
+        await self._switch(interaction, "User")
+
+    @discord.ui.button(label="Ticket", style=discord.ButtonStyle.secondary, row=0)
+    async def ticket_btn(self, interaction, button):
+        await self._switch(interaction, "Ticket")
+
+    @discord.ui.button(label="Staff", style=discord.ButtonStyle.secondary, row=0)
+    async def staff_btn(self, interaction, button):
+        await self._switch(interaction, "Staff")
+
+    @discord.ui.button(label="Message", style=discord.ButtonStyle.secondary, row=1)
+    async def msg_btn(self, interaction, button):
+        await self._switch(interaction, "Message")
+
+    @discord.ui.button(label="Security", style=discord.ButtonStyle.danger, row=1)
+    async def sec_btn(self, interaction, button):
+        await self._switch(interaction, "Security")
+
+    @discord.ui.button(label="Raw", style=discord.ButtonStyle.secondary, row=1)
+    async def raw_btn(self, interaction, button):
+        await self._switch(interaction, "Raw")
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.success, row=1)
+    async def refresh_btn(self, interaction, button):
+        await interaction.response.edit_message(embed=await self.get_embed(), view=self)
+
+    @discord.ui.button(label="Export", style=discord.ButtonStyle.primary, row=2)
+    async def export_btn(self, interaction, button):
+        text = await export_audit_text(self.guild.id, category=None if self.current_category in ("Overview","Raw") else self.current_category, user_id=self.focus_user_id)
+        path = f"/tmp/audit_export_{self.guild.id}.txt"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        await interaction.response.send_message(file=discord.File(path, filename="audit_export.txt"), ephemeral=True)
+
+    @discord.ui.button(label="Clear Raw", style=discord.ButtonStyle.danger, row=2)
+    async def clear_btn(self, interaction, button):
+        if interaction.user != self.guild.owner:
+            return await interaction.response.send_message("Only the owner can clear audit records.", ephemeral=True)
+        async with aiosqlite.connect(DB_NAME) as db:
+            if self.focus_user_id:
+                await db.execute("DELETE FROM audit_events WHERE guild_id=? AND user_id=?", (self.guild.id, self.focus_user_id))
+            else:
+                await db.execute("DELETE FROM audit_events WHERE guild_id=?", (self.guild.id,))
+            await db.commit()
+        await audit_log(self.guild, "evidence_locker", f"{interaction.user} cleared audit rows from panel.", category="Security", actor_id=interaction.user.id)
+        await interaction.response.edit_message(embed=await self.get_embed(), view=self)
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary, row=2)
+    async def prev_btn(self, interaction, button):
+        if self.current_page > 0:
+            self.current_page -= 1
+        await interaction.response.edit_message(embed=await self.get_embed(), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=2)
+    async def next_btn(self, interaction, button):
+        self.current_page += 1
+        await interaction.response.edit_message(embed=await self.get_embed(), view=self)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, row=2)
+    async def close_btn(self, interaction, button):
+        if self.update_task:
+            self.update_task.cancel()
+        await interaction.response.defer()
+        try:
+            await self.message.delete()
+        except Exception:
+            pass
+
+@bot.command()
+async def auditpanel(ctx, user: discord.Member=None):
+    if ctx.author != ctx.guild.owner:
+        return await ctx.send("❌ Only the server owner can use this command.")
+    control_room = await ensure_control_room(ctx.guild)
+    view = AuditLogPanel(ctx.guild, focus_user_id=user.id if user else None)
+    await view.start(control_room)
+    await ctx.send("🧾 Audit panel opened in #control-room.")
+
+@bot.listen("on_ready")
+async def _audit_on_ready_listener():
+    await init_audit_tables()
+    for guild in bot.guilds:
+        try:
+            invites = await guild.invites()
+            invite_cache[guild.id] = {i.code: i.uses for i in invites}
+        except Exception:
+            invite_cache[guild.id] = {}
+
+@bot.listen("on_member_join")
+async def _audit_member_join(member):
+    recent = recent_join_cache[member.guild.id]
+    recent.append((member.id, int(time.time())))
+    recent_join_cache[member.guild.id] = [(uid, ts) for uid, ts in recent if int(time.time()) - ts < 180]
+    kind = "rejoin" if member.id in cooldowns else "join"
+    await audit_log(member.guild, kind, f"{member} joined the server.", category="User", user_id=member.id)
+    await add_identity_snapshot(member.guild.id, member.id, "display_name", member.display_name)
+    await add_identity_snapshot(member.guild.id, member.id, "avatar", str(member.display_avatar.url))
+    if len(recent_join_cache[member.guild.id]) >= 4:
+        users = ", ".join(str(uid) for uid, _ in recent_join_cache[member.guild.id])
+        await audit_log(member.guild, "alt_cluster", f"Rapid join cluster detected: {users}", category="Security", user_id=member.id)
+
+@bot.listen("on_member_remove")
+async def _audit_member_remove(member):
+    await audit_log(member.guild, "leave", f"{member} left or was removed.", category="User", user_id=member.id)
+
+@bot.listen("on_member_update")
+async def _audit_member_update(before, after):
+    if before.nick != after.nick:
+        await audit_log(after.guild, "nickname_change", f"{before} nickname changed from `{before.nick}` to `{after.nick}`", category="User", user_id=after.id)
+        await add_identity_snapshot(after.guild.id, after.id, "nick", after.nick)
+    if before.display_name != after.display_name and before.nick == after.nick:
+        await audit_log(after.guild, "username_change", f"{before} display name changed from `{before.display_name}` to `{after.display_name}`", category="User", user_id=after.id)
+    if before.display_avatar != after.display_avatar:
+        await audit_log(after.guild, "avatar_change", f"{before} changed avatar.", category="User", user_id=after.id)
+        await add_identity_snapshot(after.guild.id, after.id, "avatar", str(after.display_avatar.url))
+    before_roles = {r.id for r in before.roles}
+    after_roles = {r.id for r in after.roles}
+    added = after_roles - before_roles
+    removed = before_roles - after_roles
+    for rid in added:
+        role = after.guild.get_role(rid)
+        if role:
+            et = "suspicious_role_gain" if role.permissions.administrator or role.id == PIC_PERMS_ROLE_ID else "role_added"
+            await audit_log(after.guild, et, f"Role added to {after.mention}: {role.name}", category="Security" if et=="suspicious_role_gain" else "User", user_id=after.id)
+    for rid in removed:
+        role = after.guild.get_role(rid)
+        if role:
+            await audit_log(after.guild, "role_removed", f"Role removed from {after.mention}: {role.name}", category="User", user_id=after.id)
+    if before.timed_out_until != after.timed_out_until:
+        await audit_log(after.guild, "staff_shift", f"Timeout state changed for {after.mention}.", category="Staff", user_id=after.id)
+
+@bot.listen("on_message")
+async def _audit_on_message(message):
+    if not message.guild or message.author.bot:
+        return
+    uid = message.author.id
+    cache = user_message_cache[uid]
+    cache.append((message.content, int(time.time())))
+    cache[:] = cache[-6:]
+    if message.channel.id in ticket_tracking:
+        await add_ticket_audit(message.guild.id, message.channel.id, ticket_tracking[message.channel.id].get("user_id"), "ticket_participant", f"{message.author} spoke in ticket")
+        await audit_log(message.guild, "ticket_participant", f"{message.author.mention} sent a message in {message.channel.mention}", category="Ticket", user_id=uid, channel_id=message.channel.id, message_id=message.id)
+    if any(k in message.content.lower() for k in AUDIT_KEYWORDS):
+        hit = ", ".join(k for k in AUDIT_KEYWORDS if k in message.content.lower())
+        await audit_log(message.guild, "keyword_hit", f"Keyword(s) matched: {hit}\n{message.content[:1000]}", category="Message", user_id=uid, channel_id=message.channel.id, message_id=message.id)
+    if message.attachments:
+        await audit_log(message.guild, "attachment_type", f"Attachment types: {', '.join((a.content_type or 'unknown') for a in message.attachments)}", category="Message", user_id=uid, channel_id=message.channel.id, message_id=message.id)
+        if any((a.content_type or '').startswith('audio') for a in message.attachments):
+            await audit_log(message.guild, "voice_proof", f"Voice/audio proof sent by {message.author.mention}", category="Message", user_id=uid, channel_id=message.channel.id, message_id=message.id)
+    if "http://" in message.content or "https://" in message.content:
+        await audit_log(message.guild, "link_history", message.content[:1200], category="Message", user_id=uid, channel_id=message.channel.id, message_id=message.id)
+    if message.mentions:
+        await audit_log(message.guild, "mention_history", f"Mentioned: {', '.join(m.mention for m in message.mentions[:10])}", category="Message", user_id=uid, channel_id=message.channel.id, message_id=message.id)
+    lengths = [len(c or "") for c, _ in cache]
+    if lengths:
+        avg = sum(lengths) / len(lengths)
+        if len(message.content) > avg * 3 and len(message.content) > 100:
+            await audit_log(message.guild, "message_length", f"Long message trend spike from {message.author.mention}: {len(message.content)} chars", category="Message", user_id=uid, channel_id=message.channel.id, message_id=message.id)
+    if len(cache) >= 3:
+        texts = [c for c, _ in cache[-3:]]
+        if len(set(texts)) == 1 and texts[0]:
+            await audit_log(message.guild, "copy_paste", f"Repeated identical messages from {message.author.mention}", category="Message", user_id=uid, channel_id=message.channel.id, message_id=message.id)
+        times = [ts for _, ts in cache[-4:]]
+        if len(times) >= 4 and max(times) - min(times) <= 6:
+            await audit_log(message.guild, "spam_burst", f"Rapid burst detected from {message.author.mention}", category="Message", user_id=uid, channel_id=message.channel.id, message_id=message.id)
+
+@bot.listen("on_message_edit")
+async def _audit_on_message_edit(before, after):
+    if not before.guild or before.author.bot:
+        return
+    event_type = "late_edit" if int(time.time()) - int(before.created_at.timestamp()) > 30 else "ticket_edit"
+    await audit_log(before.guild, event_type, f"Before: {before.content[:1000]}\nAfter: {after.content[:1000]}", category="Message" if event_type=="late_edit" else "Ticket", user_id=before.author.id, channel_id=before.channel.id, message_id=before.id)
+
+@bot.listen("on_message_delete")
+async def _audit_on_message_delete(message):
+    if not message.guild or (message.author and message.author.bot):
+        return
+    await audit_log(message.guild, "ticket_delete", f"Deleted message from {message.author}: {message.content[:1200]}", category="Ticket", user_id=message.author.id if message.author else None, channel_id=message.channel.id, message_id=message.id)
+
+@bot.listen("on_guild_channel_create")
+async def _audit_channel_create(channel):
+    await audit_log(channel.guild, "channel_access", f"Channel created: {channel.name}", category="Server", channel_id=channel.id)
+
+@bot.listen("on_guild_channel_delete")
+async def _audit_channel_delete(channel):
+    await audit_log(channel.guild, "channel_access", f"Channel deleted: {channel.name}", category="Server", channel_id=channel.id)
+
+@bot.listen("on_guild_channel_update")
+async def _audit_channel_update(before, after):
+    if before.overwrites != after.overwrites:
+        await audit_log(after.guild, "channel_permission_change", f"Permission overwrites changed for {after.name}", category="Security", channel_id=after.id)
+    if before.slowmode_delay != after.slowmode_delay:
+        await audit_log(after.guild, "channel_permission_change", f"Slowmode changed in {after.name} from {before.slowmode_delay} to {after.slowmode_delay}", category="Security", channel_id=after.id)
+
+@bot.listen("on_guild_role_create")
+async def _audit_role_create(role):
+    await audit_log(role.guild, "manual_role_tamper", f"Role created: {role.name}", category="Security")
+
+@bot.listen("on_guild_role_delete")
+async def _audit_role_delete(role):
+    await audit_log(role.guild, "manual_role_tamper", f"Role deleted: {role.name}", category="Security")
+
+@bot.listen("on_guild_role_update")
+async def _audit_role_update(before, after):
+    if before.permissions != after.permissions:
+        await audit_log(after.guild, "manual_role_tamper", f"Role permissions updated for {after.name}", category="Security")
+
+@bot.listen("on_reaction_add")
+async def _audit_reaction_add(reaction, user):
+    if user.bot or not reaction.message.guild:
+        return
+    await audit_log(reaction.message.guild, "reaction_audit", f"{user.mention} reacted with {reaction.emoji} in <#{reaction.message.channel.id}>", category="Message", user_id=user.id, channel_id=reaction.message.channel.id, message_id=reaction.message.id)
+
+@bot.listen("on_member_ban")
+async def _audit_member_ban(guild, user):
+    await audit_log(guild, "mass_action", f"User banned: {user}", category="Security", user_id=getattr(user, 'id', None))
+
+@bot.listen("on_member_unban")
+async def _audit_member_unban(guild, user):
+    await audit_log(guild, "mass_action", f"User unbanned: {user}", category="Security", user_id=getattr(user, 'id', None))
+
+@bot.listen("on_invite_create")
+async def _audit_invite_create(invite):
+    await audit_log(invite.guild, "invite_created", f"Invite created: {invite.code} by {invite.inviter}", category="User", actor_id=getattr(invite.inviter, 'id', None))
+
+@bot.listen("on_invite_delete")
+async def _audit_invite_delete(invite):
+    await audit_log(invite.guild, "invite_deleted", f"Invite deleted: {invite.code}", category="User")
+
+@bot.listen("on_member_join")
+async def _audit_invite_usage(member):
+    try:
+        new_invites = await member.guild.invites()
+        before = invite_cache.get(member.guild.id, {})
+        used = None
+        for inv in new_invites:
+            old_uses = before.get(inv.code, 0)
+            if inv.uses > old_uses:
+                used = inv
+                break
+        invite_cache[member.guild.id] = {i.code: i.uses for i in new_invites}
+        if used:
+            await audit_log(member.guild, "invite_used", f"{member.mention} used invite `{used.code}` created by {used.inviter}", category="User", user_id=member.id, actor_id=getattr(used.inviter, 'id', None))
+    except Exception:
+        pass
+
+async def audit_snapshot_staff(guild):
+    entries = []
+    for (g_id, staff_id), data in staff_cache.items():
+        if g_id != guild.id:
+            continue
+        score = data["approvals"] + data["denials"] + data["blacklists"] + data["notes"] + data["proof_requests"]
+        entries.append((staff_id, score, data))
+    entries.sort(key=lambda x: x[1], reverse=True)
+    if entries:
+        top = entries[:5]
+        lines = [f"<@{sid}> score={score} app={d['approvals']} den={d['denials']} blk={d['blacklists']}" for sid, score, d in top]
+        await audit_log(guild, "staff_heatmap", "\n".join(lines), category="Staff")
+
+@bot.listen("on_ready")
+async def _audit_staff_bootstrap():
+    for guild in bot.guilds:
+        await audit_snapshot_staff(guild)
+
+async def ensure_audit_panels(guild):
+    control_room = await ensure_control_room(guild)
+    audit_panel_exists = False
+    async for m in control_room.history(limit=30):
+        if m.author == guild.me and m.embeds and m.embeds[0].title and "Audit Console" in m.embeds[0].title:
+            audit_panel_exists = True
+            break
+    if not audit_panel_exists:
+        view = AuditLogPanel(guild)
+        await view.start(control_room)
+
+@bot.listen("on_ready")
+async def _audit_panel_bootstrap():
+    for guild in bot.guilds:
+        await ensure_audit_panels(guild)
 
 
 # =========================
