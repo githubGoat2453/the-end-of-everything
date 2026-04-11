@@ -165,6 +165,25 @@ async def init_db():
             created_at INTEGER
         )
         """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS warnings (
+            guild_id INTEGER,
+            user_id INTEGER,
+            reason TEXT,
+            created_by INTEGER,
+            created_at INTEGER
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS log_history (
+            guild_id INTEGER,
+            title TEXT,
+            description TEXT,
+            created_at INTEGER
+        )
+        """)
         await db.commit()
 
 
@@ -388,6 +407,16 @@ async def log_action(guild, title, description, color=0x2b2d31, *, fields=None):
         await channel.send(embed=embed)
     except Exception as e:
         print(f"Failed to log action: {e}")
+
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "INSERT INTO log_history (guild_id, title, description, created_at) VALUES (?, ?, ?, ?)",
+                (guild.id, title, description, int(time.time()))
+            )
+            await db.commit()
+    except Exception as e:
+        print(f"Failed to persist log action: {e}")
 
 
 # Control Room
@@ -642,6 +671,8 @@ class GenderButtons(discord.ui.View):
 # TICKET HELPERS
 # =========================
 paused_timers = {}
+shadow_muted_users = set()
+PIC_PERMS_ROLE_ID = 1489476010725609535
 
 
 def format_duration(seconds: int):
@@ -672,6 +703,79 @@ async def get_persistent_notes(guild_id, user_id):
             (guild_id, user_id)
         ) as cursor:
             return await cursor.fetchall()
+
+
+
+async def add_warning(guild_id, user_id, reason, created_by):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT INTO warnings (guild_id, user_id, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+            (guild_id, user_id, reason, created_by, int(time.time()))
+        )
+        await db.commit()
+
+
+async def get_warnings(guild_id, user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT reason, created_by, created_at FROM warnings WHERE guild_id=? AND user_id=? ORDER BY created_at DESC",
+            (guild_id, user_id)
+        ) as cursor:
+            return await cursor.fetchall()
+
+
+async def clear_user_logs(guild_id, user_id=None):
+    async with aiosqlite.connect(DB_NAME) as db:
+        if user_id is None:
+            await db.execute("DELETE FROM log_history WHERE guild_id=?", (guild_id,))
+        else:
+            await db.execute("DELETE FROM log_history WHERE guild_id=? AND description LIKE ?", (guild_id, f"%{user_id}%"))
+        await db.commit()
+
+
+async def export_logs_text(guild_id, user_id=None, limit=200):
+    async with aiosqlite.connect(DB_NAME) as db:
+        if user_id is None:
+            query = "SELECT title, description, created_at FROM log_history WHERE guild_id=? ORDER BY created_at DESC LIMIT ?"
+            params = (guild_id, limit)
+        else:
+            query = "SELECT title, description, created_at FROM log_history WHERE guild_id=? AND description LIKE ? ORDER BY created_at DESC LIMIT ?"
+            params = (guild_id, f"%{user_id}%", limit)
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+
+    lines = []
+    for title, description, created_at in rows:
+        lines.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(created_at))}] {title}")
+        lines.append(description)
+        lines.append("-" * 50)
+    return "\n".join(lines) if lines else "No logs found."
+
+
+async def fetch_recent_logs(guild_id, user_id=None, limit=10):
+    async with aiosqlite.connect(DB_NAME) as db:
+        if user_id is None:
+            query = "SELECT title, description, created_at FROM log_history WHERE guild_id=? ORDER BY created_at DESC LIMIT ?"
+            params = (guild_id, limit)
+        else:
+            query = "SELECT title, description, created_at FROM log_history WHERE guild_id=? AND description LIKE ? ORDER BY created_at DESC LIMIT ?"
+            params = (guild_id, f"%{user_id}%", limit)
+        async with db.execute(query, params) as cursor:
+            return await cursor.fetchall()
+
+
+def build_history_embed(member, notes_rows, warning_rows, blacklisted=False, risk_score=None, risk_reasons=None):
+    embed = discord.Embed(
+        title=f"📁 User History — {member}",
+        color=0x5865F2
+    )
+    embed.add_field(name="Warnings", value=str(len(warning_rows)), inline=True)
+    embed.add_field(name="Notes", value=str(len(notes_rows)), inline=True)
+    embed.add_field(name="Blacklisted", value="Yes" if blacklisted else "No", inline=True)
+    if risk_score is not None:
+        embed.add_field(name="Risk", value=f"{risk_score}/100", inline=True)
+        embed.add_field(name="Reasons", value=", ".join(risk_reasons) if risk_reasons else "None", inline=False)
+    return embed
 
 
 def is_staff_member(member):
@@ -1548,78 +1652,42 @@ else:
 # =========================
 # TIMER + REST OF YOUR ORIGINAL CODE
 # =========================
-
 async def start_timer(channel, member, duration=600):
-    data = ticket_tracking.get(channel.id)
-    if not data:
-        ticket_tracking[channel.id] = {
-            "user_id": member.id,
-            "staff_id": None,
-            "claimed_by": None,
-            "status": "open",
-            "created_at": discord.utils.utcnow(),
-            "created_timestamp": int(time.time()),
-            "expires_timestamp": int(time.time()) + duration,
-            "paused": False
-        }
-        data = ticket_tracking[channel.id]
+    end_time = time.time() + duration
+    warned = False
 
     embed = discord.Embed(
         title="⏳ Verification Timer",
-        description="Loading timer...",
+        description="Time remaining: **10:00**",
         color=0xED4245
     )
 
-    timer_view = TimerControls(member.id)
-    msg = await channel.send(embed=embed, view=timer_view)
-    warned = False
+    msg = await channel.send(embed=embed)
 
     while True:
         try:
-            data = ticket_tracking.get(channel.id)
-            if not data:
+            remaining = int(end_time - time.time())
+
+            if remaining <= 0:
+                embed.description = "⛔ Time is up!"
+                await msg.edit(embed=embed)
                 break
 
-            if data.get("paused"):
-                remaining = paused_timers.get(channel.id, 0)
-                embed.description = (
-                    f"**Status:** Paused ⏸️\n"
-                    f"**Time remaining:** `{format_duration(remaining)}`"
-                )
-                await msg.edit(embed=embed, view=timer_view)
-                await asyncio.sleep(1)
-                continue
+            minutes = remaining // 60
+            seconds = remaining % 60
 
-            expires_ts = data.get("expires_timestamp")
-            if not expires_ts:
-                break
-
-            remaining = max(0, int(expires_ts - time.time()))
-            embed.description = (
-                f"**Status:** Running ▶️\n"
-                f"**Time remaining:** `{format_duration(remaining)}`"
-            )
+            embed.description = f"Time remaining: **{minutes:02d}:{seconds:02d}**"
 
             if remaining <= 60 and not warned:
                 warned = True
                 await channel.send(f"⚠️ {member.mention} you have **1 minute left** to complete verification!")
 
-            await msg.edit(embed=embed, view=timer_view)
-
-            if remaining <= 0:
-                embed.description = (
-                    f"**Status:** Expired ⛔\n"
-                    f"**Time remaining:** `00:00`"
-                )
-                await msg.edit(embed=embed, view=timer_view)
-                break
-
+            await msg.edit(embed=embed)
             await asyncio.sleep(1)
 
         except discord.NotFound:
             break
-        except Exception as e:
-            print(f"Timer UI error: {e}")
+        except Exception:
             break
 
 
@@ -1894,6 +1962,24 @@ async def on_message(message):
     guild = message.guild
     if not guild:
         return await bot.process_commands(message)
+
+    if message.author.id in shadow_muted_users:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await log_action(
+            guild,
+            "🌫 Shadow Mute Intercept",
+            f"{message.author.mention} tried to speak while shadow-muted.",
+            color=0x2b2d31,
+            fields=[
+                ("User", message.author.mention, True),
+                ("User ID", str(message.author.id), True),
+                ("Channel", message.channel.mention, True)
+            ]
+        )
+        return
 
     channel = message.channel
     guild_cfg = get_guild_config(guild.id)
@@ -2237,6 +2323,159 @@ async def on_message_delete(message):
 # PROFESSIONAL ADMIN PANEL
 # =========================
 
+
+# =========================
+# PROFESSIONAL ADMIN PANEL
+# =========================
+
+def calculate_risk_score(member):
+    score = 0
+    reasons = []
+
+    account_age_days = max(0, int((discord.utils.utcnow() - member.created_at).total_seconds() // 86400))
+    if account_age_days < 3:
+        score += 45
+        reasons.append("Fresh account")
+    elif account_age_days < 7:
+        score += 25
+        reasons.append("New account")
+    elif account_age_days < 30:
+        score += 10
+        reasons.append("Young account")
+
+    if not member.avatar:
+        score += 10
+        reasons.append("No avatar")
+
+    if member.name.isdigit():
+        score += 10
+        reasons.append("Numeric username")
+
+    if member.default_avatar == member.display_avatar:
+        score += 5
+        reasons.append("Default avatar")
+
+    return min(score, 100), reasons
+
+
+async def clear_user_state(guild_id, user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM notes WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        await db.execute("DELETE FROM warnings WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        await db.execute("DELETE FROM blacklist WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        await db.commit()
+
+
+class NoteModal(discord.ui.Modal, title="Add Persistent Note"):
+    note = discord.ui.TextInput(label="Note", style=discord.TextStyle.paragraph, max_length=1000)
+
+    def __init__(self, guild, member, actor):
+        super().__init__()
+        self.guild = guild
+        self.member = member
+        self.actor = actor
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await add_persistent_note(self.guild.id, self.member.id, str(self.note), self.actor.id)
+        await log_action(
+            self.guild,
+            "📝 Note Added (Panel)",
+            f"{self.actor.mention} added a persistent note for {self.member.mention}.",
+            color=0xFEE75C,
+            fields=[
+                ("Staff", self.actor.mention, True),
+                ("User", self.member.mention, True),
+                ("Note", str(self.note)[:1000], False)
+            ]
+        )
+        await interaction.response.send_message("📝 Note saved.", ephemeral=True)
+
+
+class WarnModal(discord.ui.Modal, title="Warn User"):
+    reason = discord.ui.TextInput(label="Warning Reason", style=discord.TextStyle.paragraph, max_length=500)
+
+    def __init__(self, guild, member, actor):
+        super().__init__()
+        self.guild = guild
+        self.member = member
+        self.actor = actor
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await add_warning(self.guild.id, self.member.id, str(self.reason), self.actor.id)
+        await log_action(
+            self.guild,
+            "⚠️ Warning Added (Panel)",
+            f"{self.actor.mention} warned {self.member.mention}.",
+            color=0xFEE75C,
+            fields=[
+                ("Staff", self.actor.mention, True),
+                ("User", self.member.mention, True),
+                ("Reason", str(self.reason), False)
+            ]
+        )
+        try:
+            await self.member.send(f"⚠️ You were warned in **{self.guild.name}**.\nReason: {self.reason}")
+        except Exception:
+            pass
+        await interaction.response.send_message("⚠️ Warning added.", ephemeral=True)
+
+
+class RoleModal(discord.ui.Modal):
+    role_id = discord.ui.TextInput(label="Role ID", placeholder="Enter a role ID", max_length=30)
+
+    def __init__(self, guild, member, actor, mode="give"):
+        title = "Give Role" if mode == "give" else "Remove Role"
+        super().__init__(title=title)
+        self.guild = guild
+        self.member = member
+        self.actor = actor
+        self.mode = mode
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            rid = int(str(self.role_id).strip())
+        except ValueError:
+            return await interaction.response.send_message("Invalid role ID.", ephemeral=True)
+
+        role = self.guild.get_role(rid)
+        if not role:
+            return await interaction.response.send_message("Role not found.", ephemeral=True)
+
+        try:
+            if self.mode == "give":
+                await self.member.add_roles(role, reason=f"Panel role add by {self.actor}")
+                action_title = "➕ Role Added (Panel)"
+                action_desc = f"{self.actor.mention} gave {role.mention} to {self.member.mention}."
+            else:
+                await self.member.remove_roles(role, reason=f"Panel role remove by {self.actor}")
+                action_title = "➖ Role Removed (Panel)"
+                action_desc = f"{self.actor.mention} removed {role.mention} from {self.member.mention}."
+
+            await log_action(
+                self.guild,
+                action_title,
+                action_desc,
+                color=0x5865F2,
+                fields=[
+                    ("Staff", self.actor.mention, True),
+                    ("User", self.member.mention, True),
+                    ("Role", role.mention, True)
+                ]
+            )
+            await interaction.response.send_message("✅ Role updated.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"Failed to update role: {e}", ephemeral=True)
+
+
+class ActionSelect(discord.ui.Select):
+    def __init__(self, parent_view, placeholder, options, row):
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options, row=row)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.parent_view.handle_panel_action(interaction, self.values[0])
+
+
 class VerificationPanel(discord.ui.View):
     def __init__(self, guild, rows):
         super().__init__(timeout=None)
@@ -2245,6 +2484,60 @@ class VerificationPanel(discord.ui.View):
         self.current_page = 0
         self.message = None
         self.update_task = None
+
+        self.add_item(ActionSelect(
+            self,
+            "🔧 Core Moderation / Smart Actions",
+            [
+                discord.SelectOption(label="Accept User", value="accept", emoji="✅"),
+                discord.SelectOption(label="Deny User", value="deny", emoji="❌"),
+                discord.SelectOption(label="Kick", value="kick", emoji="👢"),
+                discord.SelectOption(label="Ban", value="ban", emoji="⛔"),
+                discord.SelectOption(label="Timeout (10m)", value="timeout", emoji="🔇"),
+                discord.SelectOption(label="Unmute", value="unmute", emoji="🔊"),
+                discord.SelectOption(label="Warn", value="warn", emoji="⚠️"),
+                discord.SelectOption(label="View Warnings", value="view_warnings", emoji="📄"),
+                discord.SelectOption(label="Auto Judge", value="auto_judge", emoji="🤖"),
+                discord.SelectOption(label="Quick Approve", value="quick_approve", emoji="⚡"),
+                discord.SelectOption(label="Force Verify", value="force_verify", emoji="♻️"),
+                discord.SelectOption(label="Risk Level Check", value="risk_check", emoji="🧠"),
+                discord.SelectOption(label="View User History", value="user_history", emoji="📁"),
+            ],
+            row=0
+        ))
+
+        self.add_item(ActionSelect(
+            self,
+            "📜 Logging / 👑 Roles",
+            [
+                discord.SelectOption(label="View Logs", value="view_logs", emoji="📜"),
+                discord.SelectOption(label="Export Logs", value="export_logs", emoji="📤"),
+                discord.SelectOption(label="Clear Logs", value="clear_logs", emoji="🧹"),
+                discord.SelectOption(label="Action Audit", value="action_audit", emoji="🕵️"),
+                discord.SelectOption(label="Give Role", value="give_role", emoji="➕"),
+                discord.SelectOption(label="Remove Role", value="remove_role", emoji="➖"),
+                discord.SelectOption(label="Toggle Pic Perms", value="toggle_pic_perms", emoji="🖼️"),
+                discord.SelectOption(label="Promote to Staff", value="promote_staff", emoji="👑"),
+                discord.SelectOption(label="Demote Staff", value="demote_staff", emoji="📉"),
+            ],
+            row=1
+        ))
+
+        self.add_item(ActionSelect(
+            self,
+            "⚙️ Server Control / 🎯 Power Actions",
+            [
+                discord.SelectOption(label="Lock Channel", value="lock_channel", emoji="🔒"),
+                discord.SelectOption(label="Unlock Channel", value="unlock_channel", emoji="🔓"),
+                discord.SelectOption(label="Toggle Slowmode", value="toggle_slowmode", emoji="🐢"),
+                discord.SelectOption(label="Emergency Lockdown", value="emergency_lockdown", emoji="🚨"),
+                discord.SelectOption(label="Mass Approve", value="mass_approve", emoji="✅"),
+                discord.SelectOption(label="Mass Deny", value="mass_deny", emoji="❌"),
+                discord.SelectOption(label="Reset User", value="reset_user", emoji="♻️"),
+                discord.SelectOption(label="Shadow Mute", value="shadow_mute", emoji="🌫️"),
+            ],
+            row=2
+        ))
 
     def _can_use_panel(self, user):
         return is_staff_member(user) or user == self.guild.owner
@@ -2270,15 +2563,20 @@ class VerificationPanel(discord.ui.View):
     def get_embed(self):
         total_pages = max(1, len(self.rows))
         embed = discord.Embed(
-            title=f"Control Room — Active Verifications (Page {self.current_page + 1}/{total_pages})",
-            description="Full remote verification controls • Auto-refreshes every 20 seconds",
+            title=f"Control Room — Verification Console ({self.current_page + 1}/{total_pages})",
+            description=(
+                "Professional staff console\n"
+                "• Row 1: Core moderation + smart actions\n"
+                "• Row 2: Logs + role management\n"
+                "• Row 3: Server controls + power tools"
+            ),
             color=0x5865F2
         )
         embed.timestamp = discord.utils.utcnow()
 
         entry = self.current_entry()
         if not entry:
-            embed.description = "✅ No active verifications."
+            embed.description = "✅ No active verifications.\nUse Refresh to check again."
             return embed
 
         user_id, ticket_id, join_ts, expires_ts, status, gender = entry
@@ -2299,24 +2597,50 @@ class VerificationPanel(discord.ui.View):
         claimed_by = track.get("claimed_by")
         claimed_text = f"<@{claimed_by}>" if claimed_by else "Nobody"
 
+        score = None
+        reasons = []
+        if member:
+            score, reasons = calculate_risk_score(member)
+
         embed.add_field(
-            name=f"{gender_icon} {username}",
+            name="👤 Selected User",
             value=(
+                f"{gender_icon} **{username}**\n"
                 f"**ID:** `{user_id}`\n"
                 f"**Ticket:** {ticket_text}\n"
-                f"**⏳ Time Left:** `{time_text}`\n"
-                f"**📅 Joined:** <t:{join_ts}:R>\n"
-                f"**📌 Status:** {status}\n"
-                f"**Gender:** {gender.capitalize() if gender else 'Not selected'}\n"
+                f"**Status:** `{status}`\n"
                 f"**Claimed By:** {claimed_text}"
+            ),
+            inline=True
+        )
+        embed.add_field(
+            name="⏱ Verification State",
+            value=(
+                f"**Time Left:** `{time_text}`\n"
+                f"**Joined:** <t:{join_ts}:R>\n"
+                f"**Gender:** {gender.capitalize() if gender else 'Not selected'}\n"
+                f"**Risk:** `{score if score is not None else 'N/A'}`"
+            ),
+            inline=True
+        )
+        embed.add_field(
+            name="🧩 Quick Categories",
+            value=(
+                "🔧 Accept / deny / warn / timeout\n"
+                "📜 Logs / audit / export\n"
+                "👑 Roles / pic perms / staff\n"
+                "⚙️ Lockdown / slowmode / power tools"
             ),
             inline=False
         )
 
+        if reasons:
+            embed.add_field(name="⚠️ Risk Reasons", value=", ".join(reasons)[:1024], inline=False)
+
         if member:
             embed.set_thumbnail(url=member.display_avatar.url)
 
-        embed.set_footer(text="Approve / deny / proof / claim / timer / automation from this panel")
+        embed.set_footer(text="Use the dropdown menus below, then navigate pages as needed")
         return embed
 
     async def start(self, channel):
@@ -2333,470 +2657,418 @@ class VerificationPanel(discord.ui.View):
             except Exception:
                 break
 
-    async def _edit_after_action(self, interaction, notice=None):
-        await self.refresh_rows()
-        if notice:
-            await interaction.response.send_message(notice, ephemeral=True)
-            if self.message:
-                await self.message.edit(embed=self.get_embed(), view=self)
-        else:
-            await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
-    async def run_panel_automation(self, channel, member, gender, actor):
-        set_ticket_status(channel.id, "automation_running")
-
-        if gender == "female":
-            questions = [
-                "1️⃣ Who invited you to this server?",
-                "2️⃣ send a VM of you speaking to prove your gender",
-                "3️⃣ Anything else you’d like staff to know?"
-            ]
-        else:
-            questions = [
-                "1️⃣ Who invited you to this server?",
-                "2️⃣  Pof $1000.00 to be accepted",
-                "3️⃣ IF you don't invite 3 girls."
-            ]
-
-        answers = []
-        response_times = []
-        lengths = []
-        path_log = []
-
-        def check_user(m):
-            return m.author.id == member.id and m.channel == channel
-
-        await channel.send(
-            f"{member.mention}\n"
-            "📋 **Automated Verification (Control Room)**\n"
-            "Please answer the following questions one by one."
-        )
-
-        start_time = discord.utils.utcnow()
-
-        for idx, q in enumerate(questions):
-            await channel.send(q)
-            q_start = discord.utils.utcnow()
-            try:
-                msg = await bot.wait_for("message", check=check_user, timeout=300)
-            except asyncio.TimeoutError:
-                answers.append("[No response — timed out]")
-                response_times.append("timeout")
-                lengths.append(0)
-                path_log.append(f"Q{idx+1}: no response (timeout)")
-                break
-
-            q_end = discord.utils.utcnow()
-            diff = (q_end - q_start).total_seconds()
-            response_times.append(f"{diff:.1f}s")
-
-            content = msg.content.strip()
-            answers.append(content[:500])
-            lengths.append(len(content))
-            path_log.append(f"Q{idx+1}: answered")
-
-            if msg.attachments:
-                await log_action(
-                    self.guild,
-                    "📎 Proof Uploaded",
-                    f"{member.mention} uploaded attachment(s) during automated verification.",
-                    color=0x5865F2,
-                    fields=[
-                        ("User", member.mention, True),
-                        ("Channel", channel.mention, True),
-                        ("Files", ", ".join(a.filename for a in msg.attachments)[:1000], False)
-                    ]
-                )
-
-        q1 = answers[0] if len(answers) > 0 else "N/A"
-        q2 = answers[1] if len(answers) > 1 else "N/A"
-        q3 = answers[2] if len(answers) > 2 else "N/A"
-
-        end_time = discord.utils.utcnow()
-        total_duration = (end_time - start_time).total_seconds()
-
-        summary_embed = discord.Embed(
-            title="📄 Automated Verification Summary",
-            description=f"User: {member.mention}\nGender: **{gender.capitalize()}**",
-            color=0x2b2d31
-        )
-        summary_embed.add_field(name="Q1: Who invited you?", value=q1, inline=False)
-        summary_embed.add_field(name="Q2: Extra verification (optional)", value=q2, inline=False)
-        summary_embed.add_field(name="Q3: Anything else?", value=q3, inline=False)
-        summary_embed.add_field(
-            name="Response Times",
-            value="\n".join(f"Q{i+1}: {response_times[i] if i < len(response_times) else 'N/A'}" for i in range(len(questions))),
-            inline=False
-        )
-        summary_embed.add_field(
-            name="Message Lengths",
-            value="\n".join(f"Q{i+1}: {lengths[i] if i < len(lengths) else 0} chars" for i in range(len(questions))),
-            inline=False
-        )
-        summary_embed.set_footer(text=f"Control Room Automation • Duration: {total_duration:.1f}s • Staff Review Required")
-        await channel.send(embed=summary_embed)
-
-        await log_action(
-            self.guild,
-            "🤖 Automation Path (Control Room)",
-            f"Automation path for {member.mention}:",
-            color=0x2b2d31,
-            fields=[("Staff", actor.mention, True), ("User", member.mention, True), ("Path", "\n".join(path_log)[:1000], False)]
-        )
-        await log_action(
-            self.guild,
-            "🧮 Automation Efficiency (Control Room)",
-            f"Automation completed for {member.mention}.",
-            color=0x57F287,
-            fields=[("Staff", actor.mention, True), ("User", member.mention, True), ("Questions", str(len(questions)), True), ("Duration", f"{total_duration:.1f}s", True)]
-        )
-        add_staff_stat(self.guild.id, actor.id, "automation_runs", 1)
-        await save_staff_stats(self.guild.id, actor.id)
-
-    async def handle_staff_action(self, interaction, action: str):
+    async def _selected(self):
         entry = self.current_entry()
         if not entry:
-            return await interaction.response.send_message("No active verification selected.", ephemeral=True)
-
+            return None, None, None, None, None, None
         user_id, ticket_id, join_ts, expires_ts, status, gender = entry
         member = self.guild.get_member(user_id)
         channel = self.guild.get_channel(ticket_id)
+        return entry, member, channel, user_id, ticket_id, gender
+
+    async def _approve_current(self, interaction, quick=False):
+        entry, member, channel, user_id, ticket_id, gender = await self._selected()
+        if not member:
+            return False, "User is no longer in the server."
+
         guild_cfg = get_guild_config(self.guild.id)
-
-        if action not in {"refresh"} and not member:
-            return await interaction.response.send_message("User is no longer in the server.", ephemeral=True)
-
-        if action == "open_ticket":
-            if not channel:
-                return await interaction.response.send_message("Ticket channel no longer exists.", ephemeral=True)
-            return await interaction.response.send_message(f"Open ticket: {channel.mention}", ephemeral=True)
-
-        if action == "refresh":
-            return await self._edit_after_action(interaction)
-
-        if action == "claim":
-            if not channel:
-                return await interaction.response.send_message("Ticket channel no longer exists.", ephemeral=True)
-
-            track = ticket_tracking.setdefault(channel.id, {})
-            claimed_by = track.get("claimed_by")
-            if claimed_by and claimed_by != interaction.user.id:
-                return await interaction.response.send_message(f"Already claimed by <@{claimed_by}>.", ephemeral=True)
-
-            track["claimed_by"] = interaction.user.id
-            track["staff_id"] = interaction.user.id
-            set_ticket_status(channel.id, "claimed")
-
-            if channel.topic and "claimed_by:" not in channel.topic:
-                try:
-                    await channel.edit(topic=channel.topic + f"|claimed_by:{interaction.user.id}")
-                except Exception:
-                    pass
-
-            add_staff_stat(self.guild.id, interaction.user.id, "tickets_claimed", 1)
-            await save_staff_stats(self.guild.id, interaction.user.id)
-            await log_action(
-                self.guild,
-                "📌 Ticket Claimed (Control Room)",
-                f"{interaction.user.mention} claimed {channel.mention} from the control room.",
-                color=0x5865F2,
-                fields=[("Staff", interaction.user.mention, True), ("Channel", channel.mention, True), ("User", member.mention, True)]
-            )
-            return await self._edit_after_action(interaction, "Ticket claimed.")
-
-        if action == "unclaim":
-            if not channel:
-                return await interaction.response.send_message("Ticket channel no longer exists.", ephemeral=True)
-            track = ticket_tracking.setdefault(channel.id, {})
-            claimed_by = track.get("claimed_by")
-            if not claimed_by:
-                return await interaction.response.send_message("This ticket is not claimed.", ephemeral=True)
-            if claimed_by != interaction.user.id and not interaction.user.guild_permissions.administrator:
-                return await interaction.response.send_message("Only the claimer or an admin can unclaim this ticket.", ephemeral=True)
-
-            track["claimed_by"] = None
-            track["staff_id"] = None
-            set_ticket_status(channel.id, "open")
-
-            if channel.topic and "claimed_by:" in channel.topic:
-                try:
-                    parts = [p for p in channel.topic.split("|") if not p.startswith("claimed_by:")]
-                    await channel.edit(topic="|".join(parts))
-                except Exception:
-                    pass
-
-            await log_action(
-                self.guild,
-                "📌 Ticket Unclaimed (Control Room)",
-                f"{interaction.user.mention} unclaimed {channel.mention} from the control room.",
-                color=0x99AAB5,
-                fields=[("Staff", interaction.user.mention, True), ("Channel", channel.mention, True), ("User", member.mention, True)]
-            )
-            return await self._edit_after_action(interaction, "Ticket unclaimed.")
-
-        if action == "pause":
-            if not channel:
-                return await interaction.response.send_message("Ticket channel no longer exists.", ephemeral=True)
-            ok, msg = await pause_ticket_timer(self.guild, channel, interaction.user)
-            if ok:
-                return await self._edit_after_action(interaction, msg)
-            return await interaction.response.send_message(msg, ephemeral=True)
-
-        if action == "resume":
-            if not channel:
-                return await interaction.response.send_message("Ticket channel no longer exists.", ephemeral=True)
-            ok, msg = await resume_ticket_timer(self.guild, channel, interaction.user)
-            if ok:
-                return await self._edit_after_action(interaction, msg)
-            return await interaction.response.send_message(msg, ephemeral=True)
-
-        if action == "proof":
-            try:
-                await member.send("📎 Staff requested more proof. Please check your verification ticket.")
-            except Exception:
-                pass
-
-            if channel:
-                set_ticket_status(channel.id, "proof_requested")
-            await log_action(
-                self.guild,
-                "🟡 Proof Requested (Control Room)",
-                f"{interaction.user.mention} requested proof from {member.mention} from the control room.",
-                color=0xFEE75C,
-                fields=[("Staff", interaction.user.mention, True), ("User", member.mention, True), ("Channel", channel.mention if channel else "Missing", True)]
-            )
-            return await self._edit_after_action(interaction, "Proof requested.")
-
-        if action == "escalate":
-            if channel:
-                set_ticket_status(channel.id, "escalated")
-            add_staff_stat(self.guild.id, interaction.user.id, "escalations", 1)
-            await save_staff_stats(self.guild.id, interaction.user.id)
-            await log_action(
-                self.guild,
-                "🚨 Ticket Escalated (Control Room)",
-                f"{interaction.user.mention} escalated {member.mention} from the control room.",
-                color=0xED4245,
-                fields=[("Staff", interaction.user.mention, True), ("User", member.mention, True), ("Channel", channel.mention if channel else "Missing", True)]
-            )
-            return await self._edit_after_action(interaction, "Ticket escalated.")
-
-        if action == "add_note":
-            await interaction.response.send_message("Type the note in this control-room channel within 3 minutes.", ephemeral=True)
-
-            def check(m):
-                return m.author == interaction.user and m.channel == interaction.channel and not m.author.bot
-
-            try:
-                msg = await bot.wait_for("message", check=check, timeout=180)
-            except asyncio.TimeoutError:
-                return await interaction.followup.send("Timed out waiting for note.", ephemeral=True)
-
-            await add_persistent_note(self.guild.id, member.id, msg.content[:1000], interaction.user.id)
-            add_staff_stat(self.guild.id, interaction.user.id, "notes", 1)
-            await save_staff_stats(self.guild.id, interaction.user.id)
-            await log_action(
-                self.guild,
-                "📝 Staff Note Added (Control Room)",
-                f"{interaction.user.mention} added a note for {member.mention} from the control room.",
-                color=0xFEE75C,
-                fields=[("Staff", interaction.user.mention, True), ("User", member.mention, True), ("Note", msg.content[:1000], False)]
-            )
-            await self.refresh_rows()
-            if self.message:
-                await self.message.edit(embed=self.get_embed(), view=self)
-            return await interaction.followup.send("Note saved.", ephemeral=True)
-
-        if action == "automation":
-            if not channel:
-                return await interaction.response.send_message("Ticket channel no longer exists.", ephemeral=True)
-            await interaction.response.send_message(f"Started Bot Automation in {channel.mention}.", ephemeral=True)
-            bot.loop.create_task(self.run_panel_automation(channel, member, gender or "male", interaction.user))
-            return
-
-        if action == "auto_judge":
-            if not channel:
-                return await interaction.response.send_message("Ticket channel no longer exists.", ephemeral=True)
-
-            set_ticket_status(channel.id, "auto_judge_running")
-            await log_action(
-                self.guild,
-                "🔍 Auto Judge Started (Control Room)",
-                f"{interaction.user.mention} started Auto Judge for {member.mention} from the control room.",
-                color=0x5865F2,
-                fields=[("Staff", interaction.user.mention, True), ("User", member.mention, True), ("Channel", channel.mention, True)]
-            )
-            judge = AutoJudge(channel, member, gender or "male")
-            bot.loop.create_task(judge.start())
-            return await interaction.response.send_message(f"Started Auto Judge in {channel.mention}.", ephemeral=True)
-
+        unverified = self.guild.get_role(guild_cfg["unverified_role"])
         male = self.guild.get_role(guild_cfg["male_role"])
         female = self.guild.get_role(guild_cfg["female_role"])
-        unverified = self.guild.get_role(guild_cfg["unverified_role"])
+        pic_perms = self.guild.get_role(PIC_PERMS_ROLE_ID)
 
-        if action == "approve":
-            if unverified and unverified in member.roles:
-                try:
-                    await member.remove_roles(unverified)
-                except Exception:
-                    pass
-            role = male if gender == "male" else female
-            if role:
-                try:
-                    await member.add_roles(role)
-                except Exception:
-                    pass
+        if unverified and unverified in member.roles:
+            await member.remove_roles(unverified)
+        if pic_perms and pic_perms in member.roles:
+            await member.remove_roles(pic_perms)
+
+        role = male if gender == "male" else female
+        if role:
+            await member.add_roles(role)
+
+        try:
+            await member.send("✅ You have been approved and verified.")
+        except Exception:
+            pass
+
+        get_daily_stats(self.guild.id)["approved"] += 1
+        set_ticket_status(ticket_id, "approved")
+        await log_action(
+            self.guild,
+            "🟢 Approved (Control Room)" if not quick else "⚡ Quick Approved (Control Room)",
+            f"{interaction.user.mention} approved {member.mention} from the control room.",
+            color=0x57F287
+        )
+        if channel:
+            await save_ticket_transcript(channel, self.guild, reason="Approved from Control Room")
             try:
-                await member.send("✅ You have been approved and verified.")
+                await channel.delete()
             except Exception:
                 pass
-            get_daily_stats(self.guild.id)["approved"] += 1
-            if channel:
-                set_ticket_status(channel.id, "approved")
-            await log_action(
-                self.guild,
-                "🟢 Approved (Control Room)",
-                f"{interaction.user.mention} approved {member.mention} from the control room.",
-                color=0x57F287,
-                fields=[("Staff", interaction.user.mention, True), ("User", member.mention, True), ("Channel", channel.mention if channel else "Missing", True)]
-            )
-            if channel:
-                await save_ticket_transcript(channel, self.guild, reason="Approved from Control Room")
-                try:
-                    await channel.delete()
-                except Exception:
-                    pass
-            await remove_from_verification(user_id, self.guild.id)
-            return await self._edit_after_action(interaction, "User approved.")
+        await remove_from_verification(user_id, self.guild.id)
+        await self.refresh_rows()
+        return True, "✅ User approved."
+
+    async def _deny_current(self, interaction, ban=False):
+        entry, member, channel, user_id, ticket_id, gender = await self._selected()
+        if not member:
+            return False, "User is no longer in the server."
+
+        pic_perms = self.guild.get_role(PIC_PERMS_ROLE_ID)
+        if pic_perms and pic_perms in member.roles:
+            try:
+                await member.remove_roles(pic_perms)
+            except Exception:
+                pass
+
+        try:
+            await member.send("❌ Your verification was denied." if not ban else "⛔ You were banned during verification.")
+        except Exception:
+            pass
+
+        try:
+            if ban:
+                await member.ban(reason=f"Banned from Control Room by {interaction.user}")
+            else:
+                await member.kick(reason=f"Denied from Control Room by {interaction.user}")
+        except Exception:
+            pass
+
+        key = "denied" if not ban else "blacklisted"
+        get_daily_stats(self.guild.id)[key] += 1
+        set_ticket_status(ticket_id, "denied" if not ban else "banned")
+        await log_action(
+            self.guild,
+            "🔴 Denied (Control Room)" if not ban else "⛔ Banned (Control Room)",
+            f"{interaction.user.mention} {'denied' if not ban else 'banned'} {member.mention} from the control room.",
+            color=0xED4245
+        )
+        if channel:
+            await save_ticket_transcript(channel, self.guild, reason="Denied from Control Room" if not ban else "Banned from Control Room")
+            try:
+                await channel.delete()
+            except Exception:
+                pass
+        await remove_from_verification(user_id, self.guild.id)
+        await self.refresh_rows()
+        return True, "✅ Action complete."
+
+    async def _panel_feedback(self, interaction, msg):
+        await self.refresh_rows()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        await interaction.followup.send(msg, ephemeral=True)
+
+    async def handle_panel_action(self, interaction, action: str):
+        entry, member, channel, user_id, ticket_id, gender = await self._selected()
+
+        if action in {"accept", "quick_approve"}:
+            ok, msg = await self._approve_current(interaction, quick=(action == "quick_approve"))
+            return await self._panel_feedback(interaction, msg)
+
+        if not member and action not in {"mass_approve", "mass_deny", "emergency_lockdown", "view_logs", "export_logs", "clear_logs"}:
+            return await interaction.response.send_message("Selected user is missing.", ephemeral=True)
 
         if action == "deny":
+            ok, msg = await self._deny_current(interaction, ban=False)
+            return await self._panel_feedback(interaction, msg)
+
+        if action == "blacklist" or action == "ban":
+            if member:
+                await add_blacklist(self.guild.id, member.id)
+            ok, msg = await self._deny_current(interaction, ban=True)
+            return await self._panel_feedback(interaction, msg)
+
+        if action == "kick":
             try:
-                await member.send("❌ Your verification was denied.")
-            except Exception:
-                pass
+                await member.kick(reason=f"Kicked from Control Room by {interaction.user}")
+            except Exception as e:
+                return await interaction.response.send_message(f"Kick failed: {e}", ephemeral=True)
+            await log_action(self.guild, "👢 Kick (Control Room)", f"{interaction.user.mention} kicked {member.mention}.", color=0xED4245)
+            await remove_from_verification(member.id, self.guild.id)
+            await self._panel_feedback(interaction, "👢 User kicked.")
+            return
+
+        if action == "timeout":
             try:
-                await member.kick(reason="Denied from Control Room")
+                until = discord.utils.utcnow() + discord.timedelta(minutes=10)
             except Exception:
-                pass
-            get_daily_stats(self.guild.id)["denied"] += 1
+                from datetime import timedelta
+                until = discord.utils.utcnow() + timedelta(minutes=10)
+            try:
+                await member.timeout(until, reason=f"Timeout by {interaction.user}")
+                await log_action(self.guild, "🔇 Timeout (Control Room)", f"{interaction.user.mention} timed out {member.mention} for 10 minutes.", color=0xFEE75C)
+                return await self._panel_feedback(interaction, "🔇 User timed out for 10 minutes.")
+            except Exception as e:
+                return await interaction.response.send_message(f"Timeout failed: {e}", ephemeral=True)
+
+        if action == "unmute":
+            try:
+                await member.timeout(None, reason=f"Unmuted by {interaction.user}")
+                await log_action(self.guild, "🔊 Unmute (Control Room)", f"{interaction.user.mention} removed timeout from {member.mention}.", color=0x57F287)
+                return await self._panel_feedback(interaction, "🔊 Timeout removed.")
+            except Exception as e:
+                return await interaction.response.send_message(f"Unmute failed: {e}", ephemeral=True)
+
+        if action == "warn":
+            return await interaction.response.send_modal(WarnModal(self.guild, member, interaction.user))
+
+        if action == "view_warnings":
+            rows = await get_warnings(self.guild.id, member.id)
+            embed = discord.Embed(title=f"⚠️ Warnings — {member}", color=0xFEE75C)
+            if not rows:
+                embed.description = "No warnings found."
+            else:
+                for i, (reason, created_by, created_at) in enumerate(rows[:10], 1):
+                    embed.add_field(name=f"Warning {i}", value=f"By: <@{created_by}>\nAt: <t:{created_at}:f>\nReason: {reason}", inline=False)
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        if action == "auto_judge":
+            set_ticket_status(ticket_id, "auto_judge_running")
+            await log_action(self.guild, "🔍 Auto Judge Started (Panel)", f"{interaction.user.mention} started Auto Judge for {member.mention}.", color=0x5865F2)
+            judge = AutoJudge(channel, member, gender)
+            bot.loop.create_task(judge.start())
+            return await self._panel_feedback(interaction, "🔍 Auto Judge started.")
+
+        if action == "force_verify":
             if channel:
-                set_ticket_status(channel.id, "denied")
-            await log_action(
-                self.guild,
-                "🔴 Denied (Control Room)",
-                f"{interaction.user.mention} denied {member.mention} from the control room.",
-                color=0xED4245,
-                fields=[("Staff", interaction.user.mention, True), ("User", member.mention, True), ("Channel", channel.mention if channel else "Missing", True)]
-            )
-            if channel:
-                await save_ticket_transcript(channel, self.guild, reason="Denied from Control Room")
+                await channel.send(f"{member.mention} ♻️ Verification has been restarted by staff.", view=GenderButtons(member.id))
+            set_ticket_status(ticket_id, "restarted")
+            await log_action(self.guild, "♻️ Force Verify (Panel)", f"{interaction.user.mention} restarted verification for {member.mention}.", color=0x5865F2)
+            return await self._panel_feedback(interaction, "♻️ Verification restarted.")
+
+        if action == "risk_check":
+            score, reasons = calculate_risk_score(member)
+            embed = discord.Embed(title=f"🧠 Risk Check — {member}", color=0xED4245 if score >= 50 else 0xFEE75C if score >= 25 else 0x57F287)
+            embed.add_field(name="Risk Score", value=f"{score}/100", inline=True)
+            embed.add_field(name="Reasons", value=", ".join(reasons) if reasons else "None", inline=False)
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        if action == "user_history":
+            notes_rows = await get_persistent_notes(self.guild.id, member.id)
+            warning_rows = await get_warnings(self.guild.id, member.id)
+            blacklisted = await is_blacklisted(self.guild.id, member.id)
+            score, reasons = calculate_risk_score(member)
+            embed = build_history_embed(member, notes_rows, warning_rows, blacklisted, score, reasons)
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        if action == "view_logs":
+            rows = await fetch_recent_logs(self.guild.id, user_id if member else None, limit=10)
+            embed = discord.Embed(title="📜 Recent Logs", color=0x5865F2)
+            if not rows:
+                embed.description = "No logs found."
+            else:
+                for title, description, created_at in rows:
+                    embed.add_field(name=f"{title} • <t:{created_at}:R>", value=description[:1000], inline=False)
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        if action == "export_logs":
+            data = await export_logs_text(self.guild.id, user_id if member else None, limit=200)
+            import io
+            fp = io.BytesIO(data.encode("utf-8"))
+            return await interaction.response.send_message(file=discord.File(fp, filename="panel_logs.txt"), ephemeral=True)
+
+        if action == "clear_logs":
+            await clear_user_logs(self.guild.id, user_id if member else None)
+            await log_action(self.guild, "🧹 Logs Cleared (Panel)", f"{interaction.user.mention} cleared logs from the panel.", color=0x99AAB5)
+            return await self._panel_feedback(interaction, "🧹 Logs cleared.")
+
+        if action == "action_audit":
+            rows = await fetch_recent_logs(self.guild.id, user_id if member else None, limit=20)
+            audit_rows = [r for r in rows if "Control Room" in r[0] or "(Panel)" in r[0]]
+            embed = discord.Embed(title="🕵️ Action Audit", color=0x5865F2)
+            if not audit_rows:
+                embed.description = "No panel audit entries found."
+            else:
+                for title, description, created_at in audit_rows[:10]:
+                    embed.add_field(name=f"{title} • <t:{created_at}:R>", value=description[:1000], inline=False)
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        if action == "give_role":
+            return await interaction.response.send_modal(RoleModal(self.guild, member, interaction.user, mode="give"))
+
+        if action == "remove_role":
+            return await interaction.response.send_modal(RoleModal(self.guild, member, interaction.user, mode="remove"))
+
+        if action == "toggle_pic_perms":
+            role = self.guild.get_role(PIC_PERMS_ROLE_ID)
+            if not role:
+                return await interaction.response.send_message("Pic perms role not found.", ephemeral=True)
+            try:
+                if role in member.roles:
+                    await member.remove_roles(role, reason=f"Pic perms toggle by {interaction.user}")
+                    state = "removed from"
+                else:
+                    await member.add_roles(role, reason=f"Pic perms toggle by {interaction.user}")
+                    state = "added to"
+                await log_action(self.guild, "🖼 Pic Perms Toggled (Panel)", f"{interaction.user.mention} {state} {member.mention}.", color=0x5865F2)
+                return await self._panel_feedback(interaction, f"🖼 Pic perms {state} user.")
+            except Exception as e:
+                return await interaction.response.send_message(f"Failed to toggle pic perms: {e}", ephemeral=True)
+
+        if action == "promote_staff" or action == "demote_staff":
+            guild_cfg = get_guild_config(self.guild.id)
+            staff_role = self.guild.get_role(guild_cfg["staff_role"]) if guild_cfg.get("staff_role") else None
+            if not staff_role:
+                return await interaction.response.send_message("Staff role not configured.", ephemeral=True)
+            try:
+                if action == "promote_staff":
+                    await member.add_roles(staff_role, reason=f"Promoted by {interaction.user}")
+                    await log_action(self.guild, "👑 Staff Promoted (Panel)", f"{interaction.user.mention} promoted {member.mention} to staff.", color=0x57F287)
+                    msg = "👑 Promoted to staff."
+                else:
+                    await member.remove_roles(staff_role, reason=f"Demoted by {interaction.user}")
+                    await log_action(self.guild, "📉 Staff Demoted (Panel)", f"{interaction.user.mention} demoted {member.mention} from staff.", color=0xED4245)
+                    msg = "📉 Staff demoted."
+                return await self._panel_feedback(interaction, msg)
+            except Exception as e:
+                return await interaction.response.send_message(f"Staff role update failed: {e}", ephemeral=True)
+
+        if action == "lock_channel" or action == "unlock_channel":
+            target_channel = channel or interaction.channel
+            overwrite = target_channel.overwrites_for(self.guild.default_role)
+            overwrite.send_messages = False if action == "lock_channel" else None
+            await target_channel.set_permissions(self.guild.default_role, overwrite=overwrite)
+            await log_action(self.guild, "🔒 Channel Locked (Panel)" if action == "lock_channel" else "🔓 Channel Unlocked (Panel)", f"{interaction.user.mention} {'locked' if action == 'lock_channel' else 'unlocked'} {target_channel.mention}.", color=0x5865F2)
+            return await self._panel_feedback(interaction, f"{'🔒 Locked' if action == 'lock_channel' else '🔓 Unlocked'} channel.")
+
+        if action == "toggle_slowmode":
+            target_channel = channel or interaction.channel
+            new_delay = 0 if target_channel.slowmode_delay else 10
+            await target_channel.edit(slowmode_delay=new_delay)
+            await log_action(self.guild, "🐢 Slowmode Toggled (Panel)", f"{interaction.user.mention} set slowmode for {target_channel.mention} to {new_delay}s.", color=0x5865F2)
+            return await self._panel_feedback(interaction, f"🐢 Slowmode set to {new_delay}s.")
+
+        if action == "emergency_lockdown":
+            changed = 0
+            for ch in self.guild.text_channels:
                 try:
-                    await channel.delete()
+                    overwrite = ch.overwrites_for(self.guild.default_role)
+                    overwrite.send_messages = False
+                    await ch.set_permissions(self.guild.default_role, overwrite=overwrite)
+                    changed += 1
                 except Exception:
                     pass
-            await remove_from_verification(user_id, self.guild.id)
-            return await self._edit_after_action(interaction, "User denied.")
+            await log_action(self.guild, "🚨 Emergency Lockdown", f"{interaction.user.mention} locked down {changed} channels.", color=0xED4245)
+            return await self._panel_feedback(interaction, f"🚨 Lockdown applied to {changed} channels.")
 
-        if action == "blacklist":
-            await add_blacklist(self.guild.id, member.id)
-            try:
-                await member.send("🚫 You have been blacklisted from this server.")
-            except Exception:
-                pass
-            try:
-                await member.kick(reason="Blacklisted from Control Room")
-            except Exception:
-                pass
-            get_daily_stats(self.guild.id)["blacklisted"] += 1
-            if channel:
-                set_ticket_status(channel.id, "blacklisted")
-            await log_action(
-                self.guild,
-                "⚫ Blacklisted (Control Room)",
-                f"{interaction.user.mention} blacklisted {member.mention} from the control room.",
-                color=0x000000,
-                fields=[("Staff", interaction.user.mention, True), ("User", member.mention, True), ("Channel", channel.mention if channel else "Missing", True)]
-            )
-            if channel:
-                await save_ticket_transcript(channel, self.guild, reason="Blacklisted from Control Room")
+        if action == "mass_approve":
+            count = 0
+            rows_copy = list(self.rows)
+            for user_id_i, ticket_id_i, _, _, _, gender_i in rows_copy:
+                member_i = self.guild.get_member(user_id_i)
+                channel_i = self.guild.get_channel(ticket_id_i)
+                if not member_i:
+                    continue
+                guild_cfg = get_guild_config(self.guild.id)
+                unverified = self.guild.get_role(guild_cfg["unverified_role"])
+                male = self.guild.get_role(guild_cfg["male_role"])
+                female = self.guild.get_role(guild_cfg["female_role"])
+                pic_role = self.guild.get_role(PIC_PERMS_ROLE_ID)
                 try:
-                    await channel.delete()
+                    if unverified and unverified in member_i.roles:
+                        await member_i.remove_roles(unverified)
+                    if pic_role and pic_role in member_i.roles:
+                        await member_i.remove_roles(pic_role)
+                    role = male if gender_i == "male" else female
+                    if role:
+                        await member_i.add_roles(role)
+                    if channel_i:
+                        await save_ticket_transcript(channel_i, self.guild, reason="Mass approved from Control Room")
+                        try:
+                            await channel_i.delete()
+                        except Exception:
+                            pass
+                    await remove_from_verification(user_id_i, self.guild.id)
+                    count += 1
                 except Exception:
                     pass
-            await remove_from_verification(user_id, self.guild.id)
-            return await self._edit_after_action(interaction, "User blacklisted.")
+            await log_action(self.guild, "✅ Mass Approve", f"{interaction.user.mention} mass-approved {count} users.", color=0x57F287)
+            return await self._panel_feedback(interaction, f"✅ Mass-approved {count} users.")
 
-    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success, row=0)
-    async def approve_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "approve")
+        if action == "mass_deny":
+            count = 0
+            rows_copy = list(self.rows)
+            for user_id_i, ticket_id_i, _, _, _, _ in rows_copy:
+                member_i = self.guild.get_member(user_id_i)
+                channel_i = self.guild.get_channel(ticket_id_i)
+                if member_i:
+                    try:
+                        await member_i.kick(reason=f"Mass denied by {interaction.user}")
+                    except Exception:
+                        pass
+                if channel_i:
+                    await save_ticket_transcript(channel_i, self.guild, reason="Mass denied from Control Room")
+                    try:
+                        await channel_i.delete()
+                    except Exception:
+                        pass
+                await remove_from_verification(user_id_i, self.guild.id)
+                count += 1
+            await log_action(self.guild, "❌ Mass Deny", f"{interaction.user.mention} mass-denied {count} users.", color=0xED4245)
+            return await self._panel_feedback(interaction, f"❌ Mass-denied {count} users.")
 
-    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.danger, row=0)
-    async def deny_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "deny")
+        if action == "reset_user":
+            await clear_user_state(self.guild.id, member.id)
+            guild_cfg = get_guild_config(self.guild.id)
+            for key in ("male_role", "female_role", "unverified_role"):
+                role = self.guild.get_role(guild_cfg[key]) if guild_cfg.get(key) else None
+                if role and role in member.roles:
+                    try:
+                        await member.remove_roles(role)
+                    except Exception:
+                        pass
+            pic_role = self.guild.get_role(PIC_PERMS_ROLE_ID)
+            if pic_role and pic_role in member.roles:
+                try:
+                    await member.remove_roles(pic_role)
+                except Exception:
+                    pass
+            await log_action(self.guild, "♻️ Reset User", f"{interaction.user.mention} reset stored state for {member.mention}.", color=0x99AAB5)
+            return await self._panel_feedback(interaction, "♻️ User state reset.")
 
-    @discord.ui.button(label="⛔ Blacklist", style=discord.ButtonStyle.secondary, row=0)
-    async def blacklist_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "blacklist")
+        if action == "shadow_mute":
+            if member.id in shadow_muted_users:
+                shadow_muted_users.remove(member.id)
+                state = "removed"
+            else:
+                shadow_muted_users.add(member.id)
+                state = "enabled"
+            await log_action(self.guild, "🌫️ Shadow Mute Toggled", f"{interaction.user.mention} {state} shadow mute for {member.mention}.", color=0x2b2d31)
+            return await self._panel_feedback(interaction, f"🌫️ Shadow mute {state}.")
 
-    @discord.ui.button(label="📎 Proof", style=discord.ButtonStyle.primary, row=0)
-    async def proof_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "proof")
+        return await interaction.response.send_message("That action is not wired yet.", ephemeral=True)
 
-    @discord.ui.button(label="🔗 Open Ticket", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="🔗 Open Ticket", style=discord.ButtonStyle.primary, row=3)
     async def open_ticket_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "open_ticket")
+        entry = self.current_entry()
+        if not entry:
+            return await interaction.response.send_message("No active verification selected.", ephemeral=True)
+        _, ticket_id, _, _, _, _ = entry
+        channel = self.guild.get_channel(ticket_id)
+        if not channel:
+            return await interaction.response.send_message("Ticket channel no longer exists.", ephemeral=True)
+        await interaction.response.send_message(f"Open this ticket: {channel.mention}", ephemeral=True)
 
-    @discord.ui.button(label="📌 Claim", style=discord.ButtonStyle.primary, row=1)
-    async def claim_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "claim")
-
-    @discord.ui.button(label="📤 Unclaim", style=discord.ButtonStyle.secondary, row=1)
-    async def unclaim_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "unclaim")
-
-    @discord.ui.button(label="🚨 Escalate", style=discord.ButtonStyle.secondary, row=1)
-    async def escalate_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "escalate")
-
-    @discord.ui.button(label="⏸ Pause", style=discord.ButtonStyle.secondary, row=1)
-    async def pause_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "pause")
-
-    @discord.ui.button(label="▶ Resume", style=discord.ButtonStyle.success, row=1)
-    async def resume_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "resume")
-
-    @discord.ui.button(label="📝 Add Note", style=discord.ButtonStyle.secondary, row=2)
-    async def add_note_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "add_note")
-
-    @discord.ui.button(label="🤖 Automation", style=discord.ButtonStyle.primary, row=2)
-    async def automation_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "automation")
-
-    @discord.ui.button(label="🔍 Auto Judge", style=discord.ButtonStyle.primary, row=2)
-    async def auto_judge_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "auto_judge")
-
-    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=3)
     async def refresh_btn(self, interaction: discord.Interaction, button):
-        await self.handle_staff_action(interaction, "refresh")
+        await self.refresh_rows()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
-    @discord.ui.button(label="⬅ Previous", style=discord.ButtonStyle.gray, row=3)
+    @discord.ui.button(label="⬅ Previous", style=discord.ButtonStyle.gray, row=4)
     async def previous(self, interaction: discord.Interaction, button):
         if self.current_page == 0:
             return await interaction.response.defer()
         self.current_page -= 1
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
-    @discord.ui.button(label="Next ➡", style=discord.ButtonStyle.gray, row=3)
+    @discord.ui.button(label="Next ➡", style=discord.ButtonStyle.gray, row=4)
     async def next(self, interaction: discord.Interaction, button):
         if self.current_page + 1 >= len(self.rows):
             return await interaction.response.defer()
         self.current_page += 1
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
-    @discord.ui.button(label="🗑 Close Panel", style=discord.ButtonStyle.danger, row=3)
+    @discord.ui.button(label="🗑 Close Panel", style=discord.ButtonStyle.danger, row=4)
     async def close(self, interaction: discord.Interaction, button):
         if self.update_task:
             self.update_task.cancel()
@@ -2822,8 +3094,7 @@ async def adminpanel(ctx):
     view = VerificationPanel(ctx.guild, rows)
     await view.start(control_room)
 
-    await ctx.send(f"{ctx.author.mention} **Control Room opened.** Please check the `#control-room` channel for the live panel with action buttons.", ephemeral=True)
-
+    await ctx.send(f"{ctx.author.mention} **Control Room opened.** Check `#control-room` for the categorized live moderation console.", ephemeral=True)
 
 # =========================
 # STAFF INACTIVITY CHECK
