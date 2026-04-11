@@ -1,3 +1,4 @@
+
 import discord
 
 from discord.ext import commands
@@ -1652,44 +1653,82 @@ else:
 # =========================
 # TIMER + REST OF YOUR ORIGINAL CODE
 # =========================
+
 async def start_timer(channel, member, duration=600):
-    end_time = time.time() + duration
-    warned = False
+    if channel.id not in ticket_tracking:
+        ticket_tracking[channel.id] = {}
+
+    data = ticket_tracking[channel.id]
+    data.setdefault("user_id", member.id)
+    data.setdefault("claimed_by", None)
+    data.setdefault("status", "open")
+    data["expires_timestamp"] = int(time.time()) + duration
+    data["paused"] = False
 
     embed = discord.Embed(
         title="⏳ Verification Timer",
-        description="Time remaining: **10:00**",
+        description="Starting timer...",
         color=0xED4245
     )
+    embed.add_field(name="Status", value="Running ▶️", inline=True)
+    embed.add_field(name="Remaining", value=f"`{format_duration(duration)}`", inline=True)
+    embed.add_field(name="User", value=member.mention, inline=True)
+    embed.set_footer(text="Use the buttons below to pause or resume this timer.")
 
-    msg = await channel.send(embed=embed)
+    view = TimerControls(member.id)
+    msg = await channel.send(embed=embed, view=view)
+    warned = False
 
     while True:
         try:
-            remaining = int(end_time - time.time())
-
-            if remaining <= 0:
-                embed.description = "⛔ Time is up!"
-                await msg.edit(embed=embed)
+            data = ticket_tracking.get(channel.id)
+            if not data:
                 break
 
-            minutes = remaining // 60
-            seconds = remaining % 60
+            if data.get("paused"):
+                remaining = paused_timers.get(channel.id, 0)
+                embed.description = "This verification timer is currently paused."
+                embed.color = 0xFEE75C
+                embed.set_field_at(0, name="Status", value="Paused ⏸️", inline=True)
+                embed.set_field_at(1, name="Remaining", value=f"`{format_duration(remaining)}`", inline=True)
+                embed.set_field_at(2, name="User", value=member.mention, inline=True)
+                await msg.edit(embed=embed, view=view)
+                await asyncio.sleep(1)
+                continue
 
-            embed.description = f"Time remaining: **{minutes:02d}:{seconds:02d}**"
+            expires_ts = data.get("expires_timestamp")
+            if not expires_ts:
+                break
+
+            remaining = max(0, int(expires_ts - time.time()))
+            embed.description = "Countdown is active. Staff can manage it from here or from the staff controls."
+            embed.color = 0x57F287 if remaining > 60 else 0xED4245
+            embed.set_field_at(0, name="Status", value="Running ▶️", inline=True)
+            embed.set_field_at(1, name="Remaining", value=f"`{format_duration(remaining)}`", inline=True)
+            embed.set_field_at(2, name="User", value=member.mention, inline=True)
 
             if remaining <= 60 and not warned:
                 warned = True
                 await channel.send(f"⚠️ {member.mention} you have **1 minute left** to complete verification!")
 
-            await msg.edit(embed=embed)
+            await msg.edit(embed=embed, view=view)
+
+            if remaining <= 0:
+                embed.description = "The timer has expired."
+                embed.color = 0xED4245
+                embed.set_field_at(0, name="Status", value="Expired ⛔", inline=True)
+                embed.set_field_at(1, name="Remaining", value="`00:00`", inline=True)
+                embed.set_field_at(2, name="User", value=member.mention, inline=True)
+                await msg.edit(embed=embed, view=view)
+                break
+
             await asyncio.sleep(1)
 
         except discord.NotFound:
             break
-        except Exception:
+        except Exception as e:
+            print(f"Timer UI error: {e}")
             break
-
 
 # =========================
 # AUTO-KICK TASK
@@ -3879,6 +3918,7 @@ async def export_audit_text(guild_id, *, category=None, user_id=None, limit=500)
         out.append("-"*60)
     return "\n".join(out) if out else "No audit events found."
 
+
 class AuditLogPanel(discord.ui.View):
     def __init__(self, guild, focus_user_id=None):
         super().__init__(timeout=None)
@@ -3895,21 +3935,32 @@ class AuditLogPanel(discord.ui.View):
         self.last_counts = await fetch_audit_counts(self.guild.id)
 
     def _group_total(self, category_name):
-        if category_name == "Overview":
-            return sum(self.last_counts.values())
-        if category_name == "Raw":
+        if category_name in ("Overview", "Raw"):
             return sum(self.last_counts.values())
         types = AUDIT_TYPE_GROUPS.get(category_name, [])
         return sum(self.last_counts.get(t, 0) for t in types)
 
     async def _category_rows(self):
         if self.current_category in ("Overview", "Raw"):
-            return await fetch_audit_events(self.guild.id, user_id=self.focus_user_id, limit=AUDIT_PAGE_SIZE, offset=self.current_page * AUDIT_PAGE_SIZE)
+            return await fetch_audit_events(
+                self.guild.id,
+                user_id=self.focus_user_id,
+                limit=AUDIT_PAGE_SIZE,
+                offset=self.current_page * AUDIT_PAGE_SIZE
+            )
+
         types = AUDIT_TYPE_GROUPS.get(self.current_category, [])
         collected = []
         for t in types:
-            rows = await fetch_audit_events(self.guild.id, event_type=t, user_id=self.focus_user_id, limit=3)
+            rows = await fetch_audit_events(
+                self.guild.id,
+                event_type=t,
+                user_id=self.focus_user_id,
+                limit=100,
+                offset=0
+            )
             collected.extend(rows)
+
         collected.sort(key=lambda r: r[-1], reverse=True)
         start = self.current_page * AUDIT_PAGE_SIZE
         end = start + AUDIT_PAGE_SIZE
@@ -3917,38 +3968,109 @@ class AuditLogPanel(discord.ui.View):
 
     async def get_embed(self):
         await self.refresh_counts()
-        total = self._group_total(self.current_category)
+        total_events = sum(self.last_counts.values())
+        current_total = self._group_total(self.current_category)
+        rows = await self._category_rows()
+
+        color_map = {
+            "Overview": 0x5865F2,
+            "User": 0x57F287,
+            "Ticket": 0xFEE75C,
+            "Staff": 0xFAA61A,
+            "Message": 0x5DADE2,
+            "Security": 0xED4245,
+            "Raw": 0x99AAB5,
+        }
+
+        icon_map = {
+            "Overview": "🧾",
+            "User": "👤",
+            "Ticket": "🎟️",
+            "Staff": "🛡️",
+            "Message": "💬",
+            "Security": "🚨",
+            "Raw": "🗂️",
+        }
+
         embed = discord.Embed(
-            title=f"🧾 Audit Console — {self.current_category}",
-            description=f"**Total tracked events:** `{sum(self.last_counts.values())}`\n**Current bucket:** `{total}`",
-            color=0x5865F2
+            title=f"{icon_map.get(self.current_category, '🧾')} Audit Console — {self.current_category}",
+            description=(
+                "A live forensic view of what the bot is tracking in this server.\n"
+                f"**Server Total:** `{total_events}` events • "
+                f"**Current Bucket:** `{current_total}` • "
+                f"**Page:** `{self.current_page + 1}`"
+            ),
+            color=color_map.get(self.current_category, 0x5865F2)
         )
+
         if self.focus_user_id:
-            embed.add_field(name="Focused User", value=f"<@{self.focus_user_id}> (`{self.focus_user_id}`)", inline=False)
-        # Summary blocks
+            member = self.guild.get_member(self.focus_user_id)
+            focus_text = member.mention if member else f"`{self.focus_user_id}`"
+            embed.add_field(name="Focus", value=f"Showing audit data for {focus_text}", inline=False)
+
         if self.current_category == "Overview":
-            for name in ["User", "Ticket", "Staff", "Message", "Security"]:
-                embed.add_field(name=name, value=str(self._group_total(name)), inline=True)
-            counts_sorted = sorted(self.last_counts.items(), key=lambda x: x[1], reverse=True)[:15]
-            if counts_sorted:
+            embed.add_field(
+                name="Core Categories",
+                value=(
+                    f"👤 User: `{self._group_total('User')}`\n"
+                    f"🎟️ Ticket: `{self._group_total('Ticket')}`\n"
+                    f"🛡️ Staff: `{self._group_total('Staff')}`"
+                ),
+                inline=True
+            )
+            embed.add_field(
+                name="Activity Categories",
+                value=(
+                    f"💬 Message: `{self._group_total('Message')}`\n"
+                    f"🚨 Security: `{self._group_total('Security')}`\n"
+                    f"🗂️ Raw: `{self._group_total('Raw')}`"
+                ),
+                inline=True
+            )
+            top_items = sorted(self.last_counts.items(), key=lambda x: x[1], reverse=True)[:12]
+            embed.add_field(
+                name="Top Event Types",
+                value="\n".join(
+                    f"• {AUDIT_TYPE_LABELS.get(key, key)} — `{value}`"
+                    for key, value in top_items
+                ) if top_items else "No events tracked yet.",
+                inline=False
+            )
+        else:
+            bucket_types = AUDIT_TYPE_GROUPS.get(self.current_category, [])
+            if self.current_category != "Raw":
                 embed.add_field(
-                    name="Top Event Types",
-                    value="\n".join(f"• {AUDIT_TYPE_LABELS.get(k,k)} — `{v}`" for k, v in counts_sorted),
+                    name="Included Event Types",
+                    value="\n".join(f"• {AUDIT_TYPE_LABELS.get(t, t)}" for t in bucket_types[:12]) or "No mapped types.",
                     inline=False
                 )
-        rows = await self._category_rows()
+
         if rows:
             for idx, (event_type, category, user_id, actor_id, channel_id, payload, created_at) in enumerate(rows, 1):
-                preview = str(payload)
-                if len(preview) > 240:
-                    preview = preview[:237] + "..."
-                stamp = f"<t:{created_at}:R>"
-                header = f"{idx}. {AUDIT_TYPE_LABELS.get(event_type, event_type)}"
-                body = f"{preview}\n`u:{user_id}` `a:{actor_id}` `c:{channel_id}` • {stamp}"
-                embed.add_field(name=header, value=body, inline=False)
+                payload_text = str(payload or "No payload")
+                if len(payload_text) > 220:
+                    payload_text = payload_text[:217] + "..."
+                meta_bits = []
+                if user_id:
+                    meta_bits.append(f"user `{user_id}`")
+                if actor_id:
+                    meta_bits.append(f"actor `{actor_id}`")
+                if channel_id:
+                    meta_bits.append(f"channel `{channel_id}`")
+                meta_bits.append(f"<t:{created_at}:R>")
+                embed.add_field(
+                    name=f"{idx}. {AUDIT_TYPE_LABELS.get(event_type, event_type)}",
+                    value=f"{payload_text}\n*{' • '.join(meta_bits)}*",
+                    inline=False
+                )
         else:
-            embed.add_field(name="No Events", value="Nothing recorded in this category yet.", inline=False)
-        embed.set_footer(text=f"Category {self.current_category} • Page {self.current_page + 1}")
+            embed.add_field(
+                name="No Events in This View",
+                value="Nothing has been recorded for this category yet.",
+                inline=False
+            )
+
+        embed.set_footer(text="Buttons: switch category • refresh • export • clear • paginate")
         return embed
 
     async def start(self, channel):
@@ -3958,7 +4080,7 @@ class AuditLogPanel(discord.ui.View):
     async def live_update(self):
         while not self.is_finished():
             try:
-                await asyncio.sleep(15)
+                await asyncio.sleep(12)
                 if self.message:
                     await self.message.edit(embed=await self.get_embed(), view=self)
             except Exception:
@@ -3969,71 +4091,90 @@ class AuditLogPanel(discord.ui.View):
         self.current_page = 0
         await interaction.response.edit_message(embed=await self.get_embed(), view=self)
 
-    @discord.ui.button(label="Overview", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="🧾 Overview", style=discord.ButtonStyle.primary, row=0)
     async def overview_btn(self, interaction, button):
         await self._switch(interaction, "Overview")
 
-    @discord.ui.button(label="User", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="👤 User", style=discord.ButtonStyle.secondary, row=0)
     async def user_btn(self, interaction, button):
         await self._switch(interaction, "User")
 
-    @discord.ui.button(label="Ticket", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="🎟️ Ticket", style=discord.ButtonStyle.secondary, row=0)
     async def ticket_btn(self, interaction, button):
         await self._switch(interaction, "Ticket")
 
-    @discord.ui.button(label="Staff", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="🛡️ Staff", style=discord.ButtonStyle.secondary, row=0)
     async def staff_btn(self, interaction, button):
         await self._switch(interaction, "Staff")
 
-    @discord.ui.button(label="Message", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="💬 Message", style=discord.ButtonStyle.secondary, row=1)
     async def msg_btn(self, interaction, button):
         await self._switch(interaction, "Message")
 
-    @discord.ui.button(label="Security", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(label="🚨 Security", style=discord.ButtonStyle.danger, row=1)
     async def sec_btn(self, interaction, button):
         await self._switch(interaction, "Security")
 
-    @discord.ui.button(label="Raw", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="🗂️ Raw", style=discord.ButtonStyle.secondary, row=1)
     async def raw_btn(self, interaction, button):
         await self._switch(interaction, "Raw")
 
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.success, row=1)
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.success, row=1)
     async def refresh_btn(self, interaction, button):
         await interaction.response.edit_message(embed=await self.get_embed(), view=self)
 
-    @discord.ui.button(label="Export", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="📤 Export", style=discord.ButtonStyle.primary, row=2)
     async def export_btn(self, interaction, button):
-        text = await export_audit_text(self.guild.id, category=None if self.current_category in ("Overview","Raw") else self.current_category, user_id=self.focus_user_id)
+        text = await export_audit_text(
+            self.guild.id,
+            category=None if self.current_category in ("Overview", "Raw") else self.current_category,
+            user_id=self.focus_user_id
+        )
         path = f"/tmp/audit_export_{self.guild.id}.txt"
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
-        await interaction.response.send_message(file=discord.File(path, filename="audit_export.txt"), ephemeral=True)
+        await interaction.response.send_message(
+            file=discord.File(path, filename="audit_export.txt"),
+            ephemeral=True
+        )
 
-    @discord.ui.button(label="Clear Raw", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="🧹 Clear", style=discord.ButtonStyle.danger, row=2)
     async def clear_btn(self, interaction, button):
         if interaction.user != self.guild.owner:
             return await interaction.response.send_message("Only the owner can clear audit records.", ephemeral=True)
+
         async with aiosqlite.connect(DB_NAME) as db:
             if self.focus_user_id:
-                await db.execute("DELETE FROM audit_events WHERE guild_id=? AND user_id=?", (self.guild.id, self.focus_user_id))
+                await db.execute(
+                    "DELETE FROM audit_events WHERE guild_id=? AND user_id=?",
+                    (self.guild.id, self.focus_user_id)
+                )
             else:
                 await db.execute("DELETE FROM audit_events WHERE guild_id=?", (self.guild.id,))
             await db.commit()
-        await audit_log(self.guild, "evidence_locker", f"{interaction.user} cleared audit rows from panel.", category="Security", actor_id=interaction.user.id)
+
+        await audit_log(
+            self.guild,
+            "evidence_locker",
+            f"{interaction.user} cleared audit rows from panel.",
+            category="Security",
+            actor_id=interaction.user.id
+        )
+        self.current_page = 0
         await interaction.response.edit_message(embed=await self.get_embed(), view=self)
 
-    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="⬅ Prev", style=discord.ButtonStyle.secondary, row=2)
     async def prev_btn(self, interaction, button):
         if self.current_page > 0:
             self.current_page -= 1
         await interaction.response.edit_message(embed=await self.get_embed(), view=self)
 
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Next ➡", style=discord.ButtonStyle.secondary, row=2)
     async def next_btn(self, interaction, button):
         self.current_page += 1
         await interaction.response.edit_message(embed=await self.get_embed(), view=self)
 
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="✖ Close", style=discord.ButtonStyle.secondary, row=2)
     async def close_btn(self, interaction, button):
         if self.update_task:
             self.update_task.cancel()
@@ -4042,6 +4183,7 @@ class AuditLogPanel(discord.ui.View):
             await self.message.delete()
         except Exception:
             pass
+
 
 @bot.command()
 async def auditpanel(ctx, user: discord.Member=None):
