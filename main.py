@@ -1548,42 +1548,78 @@ else:
 # =========================
 # TIMER + REST OF YOUR ORIGINAL CODE
 # =========================
+
 async def start_timer(channel, member, duration=600):
-    end_time = time.time() + duration
-    warned = False
+    data = ticket_tracking.get(channel.id)
+    if not data:
+        ticket_tracking[channel.id] = {
+            "user_id": member.id,
+            "staff_id": None,
+            "claimed_by": None,
+            "status": "open",
+            "created_at": discord.utils.utcnow(),
+            "created_timestamp": int(time.time()),
+            "expires_timestamp": int(time.time()) + duration,
+            "paused": False
+        }
+        data = ticket_tracking[channel.id]
 
     embed = discord.Embed(
         title="⏳ Verification Timer",
-        description="Time remaining: **10:00**",
+        description="Loading timer...",
         color=0xED4245
     )
 
-    msg = await channel.send(embed=embed)
+    timer_view = TimerControls(member.id)
+    msg = await channel.send(embed=embed, view=timer_view)
+    warned = False
 
     while True:
         try:
-            remaining = int(end_time - time.time())
-
-            if remaining <= 0:
-                embed.description = "⛔ Time is up!"
-                await msg.edit(embed=embed)
+            data = ticket_tracking.get(channel.id)
+            if not data:
                 break
 
-            minutes = remaining // 60
-            seconds = remaining % 60
+            if data.get("paused"):
+                remaining = paused_timers.get(channel.id, 0)
+                embed.description = (
+                    f"**Status:** Paused ⏸️\n"
+                    f"**Time remaining:** `{format_duration(remaining)}`"
+                )
+                await msg.edit(embed=embed, view=timer_view)
+                await asyncio.sleep(1)
+                continue
 
-            embed.description = f"Time remaining: **{minutes:02d}:{seconds:02d}**"
+            expires_ts = data.get("expires_timestamp")
+            if not expires_ts:
+                break
+
+            remaining = max(0, int(expires_ts - time.time()))
+            embed.description = (
+                f"**Status:** Running ▶️\n"
+                f"**Time remaining:** `{format_duration(remaining)}`"
+            )
 
             if remaining <= 60 and not warned:
                 warned = True
                 await channel.send(f"⚠️ {member.mention} you have **1 minute left** to complete verification!")
 
-            await msg.edit(embed=embed)
+            await msg.edit(embed=embed, view=timer_view)
+
+            if remaining <= 0:
+                embed.description = (
+                    f"**Status:** Expired ⛔\n"
+                    f"**Time remaining:** `00:00`"
+                )
+                await msg.edit(embed=embed, view=timer_view)
+                break
+
             await asyncio.sleep(1)
 
         except discord.NotFound:
             break
-        except Exception:
+        except Exception as e:
+            print(f"Timer UI error: {e}")
             break
 
 
