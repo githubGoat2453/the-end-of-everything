@@ -853,7 +853,7 @@ async def pause_ticket_timer(guild, channel, actor):
         return False, "No timer found for this ticket."
 
     expires_ts = data.get("expires_timestamp")
-    if expires_ts is None or data.get('paused'):
+    if expires_ts is None:
         return False, "No active timer to pause."
 
     if data.get("paused"):
@@ -1796,13 +1796,36 @@ async def start_timer(channel, member, duration=600):
 # AUTO-KICK TASK
 # =========================
 async def auto_kick_if_unverified(member_id, guild_id, delay=600):
-    await asyncio.sleep(delay)
-    guild = bot.get_guild(guild_id)
-    if not guild:
-        return
-    member = guild.get_member(member_id)
-    if not member:
-        return
+    start_ts = time.time()
+
+    while True:
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            return
+
+        member = guild.get_member(member_id)
+        if not member:
+            return
+
+        rows = await get_active_verifications(guild_id)
+        entry = next((row for row in rows if row[0] == member_id), None)
+        if not entry:
+            return
+
+        _user_id, channel_id, _join_ts, db_expires_ts, _status, _gender = entry
+        data = ensure_ticket_tracking_defaults(channel_id, member_id)
+
+        if data.get("paused"):
+            await asyncio.sleep(2)
+            continue
+
+        expires_ts = data.get("expires_timestamp") or db_expires_ts or int(start_ts + delay)
+        remaining = max(0, int(expires_ts - time.time()))
+        if remaining > 0:
+            await asyncio.sleep(min(2, remaining))
+            continue
+
+        break
 
     guild_cfg = get_guild_config(guild.id)
     stats = get_daily_stats(guild.id)
@@ -1811,7 +1834,7 @@ async def auto_kick_if_unverified(member_id, guild_id, delay=600):
     if unverified_role and unverified_role in member.roles:
         try:
             await member.send("⏰ You did not complete verification in time and were removed from the server.")
-        except:
+        except Exception:
             pass
         await member.kick(reason="Verification timeout")
 
@@ -2696,7 +2719,7 @@ class VerificationPanel(discord.ui.View):
 
         entry = self.current_entry()
         if not entry:
-            embed.description = "✅ No active verifications.\nUse Refresh to check again."
+            embed.description = "✅ No active verifications.\nThis panel auto-refreshes every 5 seconds."
             return embed
 
         user_id, ticket_id, join_ts, expires_ts, status, gender = entry
@@ -2770,7 +2793,7 @@ class VerificationPanel(discord.ui.View):
     async def live_update(self):
         while not self.is_finished():
             try:
-                await asyncio.sleep(20)
+                await asyncio.sleep(5)
                 await self.refresh_rows()
                 if self.message:
                     await self.message.edit(embed=self.get_embed(), view=self)
@@ -3211,7 +3234,7 @@ class VerificationUserSelect(discord.ui.Select):
             options.append(discord.SelectOption(label=label[:100], description=description[:100], value=str(idx), emoji="🎫"))
         if not options:
             options = [discord.SelectOption(label="No active tickets", value="none")]
-        super().__init__(placeholder="🎯 Select active ticket", min_values=1, max_values=1, options=options, row=3)
+        super().__init__(placeholder="🎯 Select user currently verifying", min_values=1, max_values=1, options=options, row=3)
 
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "none":
@@ -3253,7 +3276,7 @@ def _vp_get_embed(self):
 
     entry = self.current_entry()
     if not entry:
-        embed.description = "✅ No active verifications.\nUse Refresh to check again."
+        embed.description = "✅ No active verifications.\nThis panel auto-refreshes every 5 seconds."
         return embed
 
     user_id, ticket_id, join_ts, expires_ts, status, gender = entry
@@ -3319,7 +3342,7 @@ def _vp_get_embed(self):
     if member:
         embed.set_thumbnail(url=member.display_avatar.url)
 
-    embed.set_footer(text="Select any active ticket from the menu below, then use the action dropdowns")
+    embed.set_footer(text="Live every 5s • Select a user currently verifying from the menu, then run actions below")
     return embed
 
 
@@ -3332,7 +3355,7 @@ async def _vp_start(self, channel):
 async def _vp_live_update(self):
     while not self.is_finished():
         try:
-            await asyncio.sleep(20)
+            await asyncio.sleep(5)
             await self.refresh_rows()
             if self.message:
                 await self.message.edit(embed=self.get_embed(), view=self)
@@ -5824,7 +5847,7 @@ class AdvancedDashboardView(discord.ui.View):
     async def live_update(self):
         while not self.is_finished():
             try:
-                await asyncio.sleep(20)
+                await asyncio.sleep(5)
                 if self.message:
                     await self.refresh_rows()
                     await self.message.edit(embed=await self.build_embed(), view=self)
@@ -5914,7 +5937,8 @@ class AdvancedDashboardView(discord.ui.View):
         embed.add_field(name="High Priority", value=str(high_priority), inline=True)
         embed.add_field(name="Proof Pending", value=str(proof_pending), inline=True)
         embed.add_field(name="Active Staff", value=str(len([1 for (gid, _sid) in staff_cache.keys() if gid == self.guild.id])), inline=True)
-        embed.add_field(name="Auto Refresh", value="20s", inline=True)
+        embed.add_field(name="Auto Refresh", value="5s", inline=True)
+        embed.add_field(name="Mode", value="Fully Live", inline=True)
 
         ctx = await self.current_context()
         if not ctx:
@@ -5951,7 +5975,7 @@ class AdvancedDashboardView(discord.ui.View):
         for title, desc, created_at in await fetch_recent_logs(self.guild.id, ctx["user_id"], limit=3):
             preview_lines.append(f"• **{title}** — <t:{created_at}:R>")
         embed.add_field(name="Recent Activity", value="\n".join(preview_lines) if preview_lines else "No recent logs.", inline=False)
-        embed.set_footer(text=f"Ticket {self.current_index + 1}/{len(rows)} • Switch users anytime from the dropdown")
+        embed.set_footer(text=f"Live every 5s • Ticket {self.current_index + 1}/{len(rows)} • Switch users anytime from the dropdown")
         return embed
 
     async def _panel_feedback(self, interaction, message):
@@ -6234,14 +6258,29 @@ async def advanced_dashboard_command(ctx):
     control_room = await ensure_control_room(ctx.guild)
     view = AdvancedDashboardView(ctx.guild, opener=ctx.author)
     await view.start(control_room)
-    await ctx.send(f"{ctx.author.mention} advanced dashboard opened in {control_room.mention}.")
+    await ctx.send(f"{ctx.author.mention} powerful dashboard opened in {control_room.mention}.")
 
 
 @bot.command(name="adminpanel")
 async def advanced_adminpanel_command(ctx):
     if ctx.author != ctx.guild.owner and not _dashboard_is_staff(ctx.author):
         return await ctx.send("Staff only.")
+
     control_room = await ensure_control_room(ctx.guild)
-    view = AdvancedDashboardView(ctx.guild, opener=ctx.author)
-    await view.start(control_room)
-    await ctx.send(f"{ctx.author.mention} advanced admin panel opened in {control_room.mention}.")
+    rows = await get_active_verifications(ctx.guild.id)
+
+    if not rows:
+        await control_room.send(
+            embed=discord.Embed(
+                title="Hybrid Admin Panel",
+                description="✅ No active verifications.",
+                color=0x57F287
+            )
+        )
+    else:
+        view = VerificationPanel(ctx.guild, rows)
+        await view.start(control_room)
+
+    audit_view = AuditLogPanel(ctx.guild)
+    await audit_view.start(control_room)
+    await ctx.send(f"{ctx.author.mention} hybrid admin panel opened in {control_room.mention}.")
