@@ -2683,7 +2683,7 @@ class VerificationPanel(discord.ui.View):
     def get_embed(self):
         total_pages = max(1, len(self.rows))
         embed = discord.Embed(
-            title=f"Control Room — Verification Console ({self.current_page + 1}/{total_pages})",
+            title=f"⚖️ Hybrid Live Admin Panel ({self.current_page + 1}/{total_pages})",
             description=(
                 "Professional staff console\n"
                 "• Row 1: Core moderation + smart actions\n"
@@ -2770,7 +2770,7 @@ class VerificationPanel(discord.ui.View):
     async def live_update(self):
         while not self.is_finished():
             try:
-                await asyncio.sleep(20)
+                await asyncio.sleep(5)
                 await self.refresh_rows()
                 if self.message:
                     await self.message.edit(embed=self.get_embed(), view=self)
@@ -3158,7 +3158,7 @@ class VerificationPanel(discord.ui.View):
 
         return await interaction.response.send_message("That action is not wired yet.", ephemeral=True)
 
-    @discord.ui.button(label="🔗 Open Ticket", style=discord.ButtonStyle.primary, row=3)
+    @discord.ui.button(label="🔗 Open Ticket", style=discord.ButtonStyle.primary, row=4)
     async def open_ticket_btn(self, interaction: discord.Interaction, button):
         entry = self.current_entry()
         if not entry:
@@ -3169,7 +3169,7 @@ class VerificationPanel(discord.ui.View):
             return await interaction.response.send_message("Ticket channel no longer exists.", ephemeral=True)
         await interaction.response.send_message(f"Open this ticket: {channel.mention}", ephemeral=True)
 
-    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=4)
     async def refresh_btn(self, interaction: discord.Interaction, button):
         await self.refresh_rows()
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
@@ -3240,7 +3240,7 @@ async def _vp_refresh_rows(self):
 def _vp_get_embed(self):
     total_pages = max(1, len(self.rows))
     embed = discord.Embed(
-        title=f"Control Room — Verification Console ({self.current_page + 1}/{total_pages})",
+        title=f"⚖️ Hybrid Live Admin Panel ({self.current_page + 1}/{total_pages})",
         description=(
             "Professional staff console\n"
             "• Row 1: Core moderation + smart actions\n"
@@ -3332,7 +3332,7 @@ async def _vp_start(self, channel):
 async def _vp_live_update(self):
     while not self.is_finished():
         try:
-            await asyncio.sleep(20)
+            await asyncio.sleep(5)
             await self.refresh_rows()
             if self.message:
                 await self.message.edit(embed=self.get_embed(), view=self)
@@ -3356,7 +3356,7 @@ async def adminpanel(ctx):
     rows = await get_active_verifications(ctx.guild.id)
 
     if not rows:
-        await control_room.send(embed=discord.Embed(title="Control Room", description="✅ No active verifications.", color=0x57F287))
+        await control_room.send(embed=discord.Embed(title="Control Room", description="✅ No active verifications right now. When someone starts verifying, the live hybrid admin panel will appear here automatically on the next refresh.", color=0x57F287))
     else:
         view = VerificationPanel(ctx.guild, rows)
         await view.start(control_room)
@@ -5824,7 +5824,7 @@ class AdvancedDashboardView(discord.ui.View):
     async def live_update(self):
         while not self.is_finished():
             try:
-                await asyncio.sleep(20)
+                await asyncio.sleep(5)
                 if self.message:
                     await self.refresh_rows()
                     await self.message.edit(embed=await self.build_embed(), view=self)
@@ -5904,7 +5904,7 @@ class AdvancedDashboardView(discord.ui.View):
             except Exception:
                 pass
 
-        embed = discord.Embed(title="🎛️ Advanced Verification Dashboard", color=0x5865F2)
+        embed = discord.Embed(title="🚀 Maximum Live Verification Dashboard", color=0x5865F2)
         embed.description = (
             "Live staff control center. Switch users anytime from the dropdown, run actions instantly, "
             "and open dedicated panels without losing your place."
