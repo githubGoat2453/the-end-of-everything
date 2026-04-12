@@ -853,7 +853,7 @@ async def pause_ticket_timer(guild, channel, actor):
         return False, "No timer found for this ticket."
 
     expires_ts = data.get("expires_timestamp")
-    if expires_ts is None:
+    if expires_ts is None or data.get('paused'):
         return False, "No active timer to pause."
 
     if data.get("paused"):
@@ -5715,3 +5715,533 @@ async def on_ready():
     print(f"Loaded config: {config}")
 
 bot.run(os.getenv("TOKEN"))
+
+# =========================
+# PATCH FIXES (AUTO APPLIED)
+# =========================
+
+@bot.event
+async def on_guild_channel_update(before, after):
+    if isinstance(before, discord.TextChannel) and isinstance(after, discord.TextChannel):
+        if before.slowmode_delay != after.slowmode_delay:
+            pass
+
+@bot.event
+async def on_member_join(member):
+    guild = member.guild
+    pic_role = guild.get_role(PIC_PERMS_ROLE_ID)
+    if pic_role:
+        try:
+            await member.add_roles(pic_role)
+        except:
+            pass
+
+
+
+
+# =========================
+# ADVANCED LIVE DASHBOARD OVERRIDE
+# =========================
+
+def _dashboard_is_staff(member):
+    try:
+        return is_staff_member(member) or member == member.guild.owner
+    except Exception:
+        return False
+
+
+async def _dashboard_remove_pic_perms(guild, member):
+    try:
+        role = guild.get_role(PIC_PERMS_ROLE_ID)
+        if role and role in member.roles:
+            await member.remove_roles(role)
+    except Exception:
+        pass
+
+
+class DashboardTicketSelect(discord.ui.Select):
+    def __init__(self, dashboard_view, rows):
+        self.dashboard_view = dashboard_view
+        options = []
+        for idx, entry in enumerate(rows[:25]):
+            user_id, channel_id, _join_ts, _expires_ts, status, gender = entry
+            member = dashboard_view.guild.get_member(user_id)
+            channel = dashboard_view.guild.get_channel(channel_id)
+            priority = "medium"
+            data = ticket_tracking.get(channel_id, {})
+            if data.get("priority_cache"):
+                priority = data["priority_cache"]
+            label = member.display_name if member else f"User {user_id}"
+            desc = f"{(gender or 'unknown').title()} • {status[:35]}"
+            if channel:
+                desc = f"{desc[:70]} • {channel.name[:18]}"
+            emoji = "🔴" if priority == "high" else "🟡" if priority == "medium" else "🟢"
+            options.append(discord.SelectOption(
+                label=label[:100],
+                description=desc[:100],
+                value=str(idx),
+                emoji=emoji
+            ))
+        if not options:
+            options = [discord.SelectOption(label="No active tickets", value="none", emoji="✅")]
+        super().__init__(
+            placeholder="Switch user / ticket instantly",
+            options=options,
+            row=0,
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            return await interaction.response.send_message("✅ No active tickets.", ephemeral=True)
+        self.dashboard_view.current_index = int(self.values[0])
+        await self.dashboard_view.refresh_rows()
+        await interaction.response.edit_message(embed=await self.dashboard_view.build_embed(), view=self.dashboard_view)
+
+
+class AdvancedDashboardView(discord.ui.View):
+    def __init__(self, guild, opener=None):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.opener = opener
+        self.rows = []
+        self.current_index = 0
+        self.message = None
+        self.update_task = None
+
+    async def start(self, channel):
+        await self.refresh_rows()
+        self.message = await channel.send(embed=await self.build_embed(), view=self)
+        self.update_task = bot.loop.create_task(self.live_update())
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if not _dashboard_is_staff(interaction.user):
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return False
+        return True
+
+    async def live_update(self):
+        while not self.is_finished():
+            try:
+                await asyncio.sleep(20)
+                if self.message:
+                    await self.refresh_rows()
+                    await self.message.edit(embed=await self.build_embed(), view=self)
+            except Exception:
+                break
+
+    def stop(self):
+        if self.update_task:
+            self.update_task.cancel()
+        super().stop()
+
+    async def refresh_rows(self):
+        self.rows = await get_sorted_queue_rows(self.guild.id)
+        if self.rows:
+            self.current_index = max(0, min(self.current_index, len(self.rows) - 1))
+        else:
+            self.current_index = 0
+        self._rebuild_select()
+
+    def _rebuild_select(self):
+        for item in list(self.children):
+            if isinstance(item, DashboardTicketSelect):
+                self.remove_item(item)
+        self.add_item(DashboardTicketSelect(self, self.rows))
+
+    async def current_row(self):
+        if not self.rows:
+            return None
+        return self.rows[self.current_index]
+
+    async def current_context(self):
+        row = await self.current_row()
+        if not row:
+            return None
+        user_id, channel_id, join_ts, expires_ts, status, gender = row
+        member = self.guild.get_member(user_id)
+        channel = self.guild.get_channel(channel_id)
+        data = ensure_ticket_tracking_defaults(channel_id, user_id)
+        priority = await get_ticket_priority(self.guild.id, channel_id)
+        data["priority_cache"] = priority
+        proof = await get_proof_review(self.guild.id, channel_id)
+        notes_rows = await get_persistent_notes(self.guild.id, user_id)
+        warnings_rows = await get_warnings(self.guild.id, user_id)
+        claimed_by = data.get("claimed_by")
+        return {
+            "row": row,
+            "user_id": user_id,
+            "channel_id": channel_id,
+            "join_ts": join_ts,
+            "expires_ts": expires_ts,
+            "status": status,
+            "gender": gender,
+            "member": member,
+            "channel": channel,
+            "data": data,
+            "priority": priority,
+            "proof": proof,
+            "notes_rows": notes_rows,
+            "warnings_rows": warnings_rows,
+            "claimed_by": claimed_by,
+        }
+
+    async def build_embed(self):
+        await self.refresh_rows()
+        rows = self.rows
+        open_count = len(rows)
+        claimed = sum(1 for _uid, ch_id, *_ in rows if ticket_tracking.get(ch_id, {}).get("claimed_by"))
+        high_priority = 0
+        proof_pending = 0
+        for _uid, ch_id, *_ in rows:
+            try:
+                if await get_ticket_priority(self.guild.id, ch_id) == "high":
+                    high_priority += 1
+                proof = await get_proof_review(self.guild.id, ch_id)
+                if proof["status"] in ("pending", "needs_review", "suspicious"):
+                    proof_pending += 1
+            except Exception:
+                pass
+
+        embed = discord.Embed(title="🎛️ Advanced Verification Dashboard", color=0x5865F2)
+        embed.description = (
+            "Live staff control center. Switch users anytime from the dropdown, run actions instantly, "
+            "and open dedicated panels without losing your place."
+        )
+        embed.add_field(name="Open Tickets", value=str(open_count), inline=True)
+        embed.add_field(name="Claimed", value=str(claimed), inline=True)
+        embed.add_field(name="High Priority", value=str(high_priority), inline=True)
+        embed.add_field(name="Proof Pending", value=str(proof_pending), inline=True)
+        embed.add_field(name="Active Staff", value=str(len([1 for (gid, _sid) in staff_cache.keys() if gid == self.guild.id])), inline=True)
+        embed.add_field(name="Auto Refresh", value="20s", inline=True)
+
+        ctx = await self.current_context()
+        if not ctx:
+            embed.add_field(name="Status", value="✅ No active tickets right now.", inline=False)
+            embed.set_footer(text="Dashboard • waiting for new verifications")
+            return embed
+
+        member = ctx["member"]
+        channel = ctx["channel"]
+        data = ctx["data"]
+        proof = ctx["proof"]
+        claimed_by = ctx["claimed_by"]
+        risk_score, risk_reasons = calculate_risk_score(member) if member else (0, [])
+        remaining = format_duration(max(0, int((data.get("expires_timestamp") or ctx["expires_ts"] or int(time.time())) - time.time())))
+        category_name = channel.category.name if channel and channel.category else "Unknown"
+        template_name = data.get("template_name") or "Default"
+
+        embed.add_field(name="Selected User", value=member.mention if member else f"`{ctx['user_id']}`", inline=True)
+        embed.add_field(name="Ticket", value=channel.mention if channel else f"`{ctx['channel_id']}`", inline=True)
+        embed.add_field(name="Category", value=category_name, inline=True)
+        embed.add_field(name="Gender", value=(ctx["gender"] or "unknown").title(), inline=True)
+        embed.add_field(name="Status", value=ctx["status"], inline=True)
+        embed.add_field(name="Priority", value=ctx["priority"].title(), inline=True)
+        embed.add_field(name="Claimed By", value=f"<@{claimed_by}>" if claimed_by else "Nobody", inline=True)
+        embed.add_field(name="Proof", value=proof["status"].replace("_", " ").title(), inline=True)
+        embed.add_field(name="Timer", value=("Paused ⏸️" if data.get("paused") else remaining), inline=True)
+        embed.add_field(name="Template", value=template_name[:100], inline=True)
+        embed.add_field(name="Msgs", value=f"User {data.get('user_msg_count',0)} • Staff {data.get('staff_msg_count',0)}", inline=True)
+        embed.add_field(name="Attachments", value=str(len(data.get("attachments", []))), inline=True)
+        embed.add_field(name="Risk", value=f"{risk_score}/100", inline=True)
+        embed.add_field(name="Risk Reasons", value=", ".join(risk_reasons)[:1024] if risk_reasons else "None", inline=False)
+
+        preview_lines = []
+        for title, desc, created_at in await fetch_recent_logs(self.guild.id, ctx["user_id"], limit=3):
+            preview_lines.append(f"• **{title}** — <t:{created_at}:R>")
+        embed.add_field(name="Recent Activity", value="\n".join(preview_lines) if preview_lines else "No recent logs.", inline=False)
+        embed.set_footer(text=f"Ticket {self.current_index + 1}/{len(rows)} • Switch users anytime from the dropdown")
+        return embed
+
+    async def _panel_feedback(self, interaction, message):
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+        try:
+            await interaction.followup.send(message, ephemeral=True)
+        except Exception:
+            pass
+
+    async def _selected_member_channel(self):
+        ctx = await self.current_context()
+        if not ctx:
+            return None, None, None
+        return ctx, ctx["member"], ctx["channel"]
+
+    async def _finalize_close(self, interaction, member, channel, reason, status_name, color):
+        guild_cfg = get_guild_config(self.guild.id)
+        unverified = self.guild.get_role(guild_cfg["unverified_role"]) if guild_cfg.get("unverified_role") else None
+        if member and unverified and unverified in member.roles and status_name in ("denied", "blacklisted"):
+            try:
+                await member.remove_roles(unverified)
+            except Exception:
+                pass
+        if member:
+            await _dashboard_remove_pic_perms(self.guild, member)
+        if channel:
+            try:
+                await save_ticket_transcript(channel, self.guild, reason=reason)
+            except Exception:
+                pass
+        if member:
+            await remove_from_verification(member.id, self.guild.id)
+        set_ticket_status(channel.id if channel else 0, status_name)
+        await self.refresh_rows()
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+        try:
+            if channel:
+                await channel.delete()
+        except Exception:
+            pass
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh_btn(self, interaction: discord.Interaction, button):
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="📂 Open Ticket", style=discord.ButtonStyle.primary, row=1)
+    async def open_btn(self, interaction: discord.Interaction, button):
+        ctx, member, channel = await self._selected_member_channel()
+        if not ctx:
+            return await interaction.response.send_message("No ticket selected.", ephemeral=True)
+        await interaction.response.send_message(f"Open ticket: {channel.mention if channel else 'Missing channel'} • User: {member.mention if member else ctx['user_id']}", ephemeral=True)
+
+    @discord.ui.button(label="🛡️ Claim/Unclaim", style=discord.ButtonStyle.success, row=1)
+    async def claim_unclaim_btn(self, interaction: discord.Interaction, button):
+        ctx, member, channel = await self._selected_member_channel()
+        if not ctx:
+            return await interaction.response.send_message("No ticket selected.", ephemeral=True)
+        data = ctx["data"]
+        current = data.get("claimed_by")
+        if current and current != interaction.user.id and not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("Only the claimer or an admin can unclaim this ticket.", ephemeral=True)
+        if current == interaction.user.id:
+            data["claimed_by"] = None
+            set_ticket_status(ctx["channel_id"], "open")
+            await log_action(self.guild, "🟡 Ticket Unclaimed (Dashboard)", f"{interaction.user.mention} unclaimed {channel.mention if channel else ctx['channel_id']}.", color=0xFEE75C)
+            return await self._panel_feedback(interaction, "🟡 Ticket unclaimed.")
+        data["claimed_by"] = interaction.user.id
+        set_ticket_status(ctx["channel_id"], "claimed")
+        add_staff_stat(self.guild.id, interaction.user.id, "tickets_claimed", 1)
+        await save_staff_stats(self.guild.id, interaction.user.id)
+        await log_action(self.guild, "🛡️ Ticket Claimed (Dashboard)", f"{interaction.user.mention} claimed {channel.mention if channel else ctx['channel_id']}.", color=0x57F287, fields=[("User", member.mention if member else str(ctx["user_id"]), True)])
+        return await self._panel_feedback(interaction, "🛡️ Ticket claimed.")
+
+    @discord.ui.button(label="🎫 Queue", style=discord.ButtonStyle.primary, row=1)
+    async def queue_btn(self, interaction: discord.Interaction, button):
+        view = QueuePanelView(self.guild)
+        await interaction.response.send_message(embed=await view.build_embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="👥 Staff", style=discord.ButtonStyle.success, row=1)
+    async def staff_btn(self, interaction: discord.Interaction, button):
+        view = StaffPerformancePanelView(self.guild)
+        await interaction.response.send_message(embed=await view.build_embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success, row=2)
+    async def approve_btn(self, interaction: discord.Interaction, button):
+        ctx, member, channel = await self._selected_member_channel()
+        if not ctx or not member:
+            return await interaction.response.send_message("User not found.", ephemeral=True)
+        guild_cfg = get_guild_config(self.guild.id)
+        male = self.guild.get_role(guild_cfg["male_role"]) if guild_cfg.get("male_role") else None
+        female = self.guild.get_role(guild_cfg["female_role"]) if guild_cfg.get("female_role") else None
+        unverified = self.guild.get_role(guild_cfg["unverified_role"]) if guild_cfg.get("unverified_role") else None
+        if unverified and unverified in member.roles:
+            try:
+                await member.remove_roles(unverified)
+            except Exception:
+                pass
+        role = male if (ctx["gender"] or "").lower() == "male" else female
+        if role:
+            try:
+                await member.add_roles(role)
+            except Exception:
+                pass
+        await _dashboard_remove_pic_perms(self.guild, member)
+        try:
+            await member.send("✅ You have been approved and verified.")
+        except Exception:
+            pass
+        get_daily_stats(self.guild.id)["approved"] += 1
+        await log_action(self.guild, "🟢 Approved (Dashboard)", f"{interaction.user.mention} approved {member.mention}.", color=0x57F287, fields=[("Channel", channel.mention if channel else "Missing", True)])
+        add_staff_stat(self.guild.id, interaction.user.id, "approvals", 1)
+        add_staff_stat(self.guild.id, interaction.user.id, "tickets_closed", 1)
+        await save_staff_stats(self.guild.id, interaction.user.id)
+        await self._finalize_close(interaction, member, channel, "Approved by Dashboard", "approved", 0x57F287)
+
+    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.danger, row=2)
+    async def deny_btn(self, interaction: discord.Interaction, button):
+        ctx, member, channel = await self._selected_member_channel()
+        if not ctx or not member:
+            return await interaction.response.send_message("User not found.", ephemeral=True)
+        await _dashboard_remove_pic_perms(self.guild, member)
+        try:
+            await member.send("❌ Your verification was denied.")
+        except Exception:
+            pass
+        try:
+            await member.kick(reason="Denied by dashboard")
+        except Exception:
+            pass
+        get_daily_stats(self.guild.id)["denied"] += 1
+        await log_action(self.guild, "🔴 Denied (Dashboard)", f"{interaction.user.mention} denied {member.mention}.", color=0xED4245, fields=[("Channel", channel.mention if channel else "Missing", True)])
+        add_staff_stat(self.guild.id, interaction.user.id, "denials", 1)
+        add_staff_stat(self.guild.id, interaction.user.id, "tickets_closed", 1)
+        await save_staff_stats(self.guild.id, interaction.user.id)
+        await self._finalize_close(interaction, member, channel, "Denied by Dashboard", "denied", 0xED4245)
+
+    @discord.ui.button(label="🚫 Blacklist", style=discord.ButtonStyle.secondary, row=2)
+    async def blacklist_btn(self, interaction: discord.Interaction, button):
+        ctx, member, channel = await self._selected_member_channel()
+        if not ctx or not member:
+            return await interaction.response.send_message("User not found.", ephemeral=True)
+        await add_blacklist(self.guild.id, member.id)
+        await _dashboard_remove_pic_perms(self.guild, member)
+        try:
+            await member.send("🚫 You have been blacklisted from this server.")
+        except Exception:
+            pass
+        try:
+            await member.kick(reason="Blacklisted by dashboard")
+        except Exception:
+            pass
+        get_daily_stats(self.guild.id)["blacklisted"] += 1
+        await log_action(self.guild, "⚫ Blacklisted (Dashboard)", f"{interaction.user.mention} blacklisted {member.mention}.", color=0x000000, fields=[("Channel", channel.mention if channel else "Missing", True)])
+        add_staff_stat(self.guild.id, interaction.user.id, "blacklists", 1)
+        add_staff_stat(self.guild.id, interaction.user.id, "tickets_closed", 1)
+        await save_staff_stats(self.guild.id, interaction.user.id)
+        await self._finalize_close(interaction, member, channel, "Blacklisted by Dashboard", "blacklisted", 0x000000)
+
+    @discord.ui.button(label="📜 History", style=discord.ButtonStyle.secondary, row=2)
+    async def history_btn(self, interaction: discord.Interaction, button):
+        ctx, member, _channel = await self._selected_member_channel()
+        if not ctx or not member:
+            return await interaction.response.send_message("User not found.", ephemeral=True)
+        blacklisted = await is_blacklisted(self.guild.id, member.id)
+        score, reasons = calculate_risk_score(member)
+        embed = build_history_embed(member, ctx["notes_rows"], ctx["warnings_rows"], blacklisted, score, reasons)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🧾 Logs", style=discord.ButtonStyle.secondary, row=2)
+    async def logs_btn(self, interaction: discord.Interaction, button):
+        ctx, member, _channel = await self._selected_member_channel()
+        if not ctx:
+            return await interaction.response.send_message("No ticket selected.", ephemeral=True)
+        rows = await fetch_recent_logs(self.guild.id, ctx["user_id"], limit=10)
+        embed = discord.Embed(title=f"🧾 Recent Logs — {member if member else ctx['user_id']}", color=0x5865F2)
+        if not rows:
+            embed.description = "No logs found."
+        else:
+            for title, description, created_at in rows[:10]:
+                embed.add_field(name=f"{title} • <t:{created_at}:R>", value=description[:1000], inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🟢 Low", style=discord.ButtonStyle.secondary, row=3)
+    async def low_btn(self, interaction: discord.Interaction, button):
+        await self._set_priority(interaction, "low")
+
+    @discord.ui.button(label="🟡 Medium", style=discord.ButtonStyle.primary, row=3)
+    async def medium_btn(self, interaction: discord.Interaction, button):
+        await self._set_priority(interaction, "medium")
+
+    @discord.ui.button(label="🔴 High", style=discord.ButtonStyle.danger, row=3)
+    async def high_btn(self, interaction: discord.Interaction, button):
+        await self._set_priority(interaction, "high")
+
+    @discord.ui.button(label="✅ Proof OK", style=discord.ButtonStyle.success, row=3)
+    async def proof_ok_btn(self, interaction: discord.Interaction, button):
+        await self._set_proof(interaction, "valid")
+
+    @discord.ui.button(label="⚠️ Suspicious", style=discord.ButtonStyle.secondary, row=3)
+    async def proof_suspicious_btn(self, interaction: discord.Interaction, button):
+        await self._set_proof(interaction, "suspicious")
+
+    async def _set_priority(self, interaction, priority):
+        ctx, member, channel = await self._selected_member_channel()
+        if not ctx:
+            return await interaction.response.send_message("No ticket selected.", ephemeral=True)
+        await set_ticket_priority_db(self.guild.id, ctx["channel_id"], priority, interaction.user.id)
+        if channel:
+            try:
+                await channel.send(f"🏷️ Priority updated to **{priority.title()}** by {interaction.user.mention}.")
+            except Exception:
+                pass
+        await log_action(self.guild, "🏷️ Ticket Priority Updated (Dashboard)", f"{interaction.user.mention} set {channel.mention if channel else ctx['channel_id']} to **{priority.title()}**.", color=0x5865F2, fields=[("User", member.mention if member else str(ctx["user_id"]), True)])
+        await self._panel_feedback(interaction, f"🏷️ Priority set to {priority.title()}.")
+
+    async def _set_proof(self, interaction, status):
+        ctx, member, channel = await self._selected_member_channel()
+        if not ctx:
+            return await interaction.response.send_message("No ticket selected.", ephemeral=True)
+        proof_type = "attachment" if ctx["data"].get("attachments") else "text_only"
+        notes = f"Updated from advanced dashboard by {interaction.user}"
+        await set_proof_review(self.guild.id, ctx["channel_id"], ctx["user_id"], status, proof_type, notes, interaction.user.id)
+        if channel:
+            try:
+                await channel.send(f"📎 Proof review updated to **{status.replace('_', ' ').title()}** by {interaction.user.mention}.")
+            except Exception:
+                pass
+        await log_action(self.guild, "📎 Proof Review Updated (Dashboard)", f"{interaction.user.mention} marked proof for {member.mention if member else ctx['user_id']} as **{status.replace('_',' ').title()}**.", color=0x5865F2)
+        await self._panel_feedback(interaction, f"📎 Proof marked {status.replace('_', ' ').title()}.")
+
+    @discord.ui.button(label="⏳ Pending", style=discord.ButtonStyle.secondary, row=4)
+    async def proof_pending_btn(self, interaction: discord.Interaction, button):
+        await self._set_proof(interaction, "pending")
+
+    @discord.ui.button(label="🧩 Templates", style=discord.ButtonStyle.primary, row=4)
+    async def templates_btn(self, interaction: discord.Interaction, button):
+        view = TemplateManagerView(self.guild, interaction.user)
+        await interaction.response.send_message(embed=await view.build_embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="📎 Proof Center", style=discord.ButtonStyle.primary, row=4)
+    async def proofcenter_btn(self, interaction: discord.Interaction, button):
+        view = ProofCenterPanelView(self.guild)
+        await interaction.response.send_message(embed=await view.build_embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="🕵️ Audit", style=discord.ButtonStyle.secondary, row=4)
+    async def audit_btn(self, interaction: discord.Interaction, button):
+        ctx, member, _channel = await self._selected_member_channel()
+        focus_user_id = ctx["user_id"] if ctx else None
+        control_room = await ensure_control_room(self.guild)
+        view = AuditLogPanel(self.guild, focus_user_id=focus_user_id)
+        await view.start(control_room)
+        await interaction.response.send_message(f"🕵️ Audit panel opened in {control_room.mention} for {member.mention if member else 'selected user'}.", ephemeral=True)
+
+    @discord.ui.button(label="✖ Close", style=discord.ButtonStyle.danger, row=4)
+    async def close_btn(self, interaction: discord.Interaction, button):
+        if self.update_task:
+            self.update_task.cancel()
+        await interaction.response.defer()
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+
+
+try:
+    bot.remove_command("dashboard")
+except Exception:
+    pass
+
+try:
+    bot.remove_command("adminpanel")
+except Exception:
+    pass
+
+
+@bot.command(name="dashboard")
+async def advanced_dashboard_command(ctx):
+    if not _dashboard_is_staff(ctx.author):
+        return await ctx.send("Staff only.")
+    control_room = await ensure_control_room(ctx.guild)
+    view = AdvancedDashboardView(ctx.guild, opener=ctx.author)
+    await view.start(control_room)
+    await ctx.send(f"{ctx.author.mention} advanced dashboard opened in {control_room.mention}.")
+
+
+@bot.command(name="adminpanel")
+async def advanced_adminpanel_command(ctx):
+    if ctx.author != ctx.guild.owner and not _dashboard_is_staff(ctx.author):
+        return await ctx.send("Staff only.")
+    control_room = await ensure_control_room(ctx.guild)
+    view = AdvancedDashboardView(ctx.guild, opener=ctx.author)
+    await view.start(control_room)
+    await ctx.send(f"{ctx.author.mention} advanced admin panel opened in {control_room.mention}.")
