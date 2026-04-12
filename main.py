@@ -71,6 +71,9 @@ def get_guild_config(guild_id: int):
         config[guild_id] = {
             "log_channel": None,
             "category": None,
+            "general_category": None,
+            "male_category": None,
+            "female_category": None,
             "male_role": None,
             "female_role": None,
             "unverified_role": None,
@@ -505,6 +508,55 @@ async def save_ticket_transcript(channel, guild, reason="Ticket Closed"):
         print(f"Transcript error: {e}")
 
 
+def ticket_config_ready(guild_cfg):
+    required_keys = [
+        "log_channel",
+        "general_category",
+        "male_category",
+        "female_category",
+        "male_role",
+        "female_role",
+        "unverified_role",
+        "staff_role",
+    ]
+    return all(guild_cfg.get(k) is not None for k in required_keys)
+
+
+async def ensure_verification_categories(guild):
+    guild_cfg = get_guild_config(guild.id)
+    staff_role = guild.get_role(guild_cfg.get("staff_role")) if guild_cfg.get("staff_role") else None
+
+    base_overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True, read_message_history=True),
+    }
+    if staff_role:
+        base_overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+    if guild.owner:
+        base_overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+
+    async def _get_or_create(cat_id_key, names):
+        cat = guild.get_channel(guild_cfg.get(cat_id_key)) if guild_cfg.get(cat_id_key) else None
+        if cat and isinstance(cat, discord.CategoryChannel):
+            return cat
+        for name in names:
+            cat = discord.utils.get(guild.categories, name=name)
+            if cat:
+                guild_cfg[cat_id_key] = cat.id
+                return cat
+        cat = await guild.create_category(names[0], overwrites=base_overwrites)
+        guild_cfg[cat_id_key] = cat.id
+        return cat
+
+    general = await _get_or_create("general_category", ["General Ticket", "Verification Tickets"])
+    male = await _get_or_create("male_category", ["Male Tickets"])
+    female = await _get_or_create("female_category", ["Female Tickets"])
+
+    guild_cfg["category"] = general.id
+    await save_config_for_guild(guild.id)
+    return general, male, female
+
+
 # =========================
 # SETUP COMMAND
 # =========================
@@ -514,17 +566,25 @@ async def setup(ctx):
     guild = ctx.guild
     guild_cfg = get_guild_config(guild.id)
 
-    male = await guild.create_role(name="Male", color=discord.Color.blue())
-    female = await guild.create_role(name="Female", color=discord.Color.from_rgb(255, 105, 180))
-    unverified = await guild.create_role(name="Unverified", color=discord.Color.light_grey())
-    staff = await guild.create_role(name="Staff", color=discord.Color.gold())
+    male = discord.utils.get(guild.roles, name="Male") or await guild.create_role(name="Male", color=discord.Color.blue())
+    female = discord.utils.get(guild.roles, name="Female") or await guild.create_role(name="Female", color=discord.Color.from_rgb(255, 105, 180))
+    unverified = discord.utils.get(guild.roles, name="Unverified") or await guild.create_role(name="Unverified", color=discord.Color.light_grey())
+    staff = discord.utils.get(guild.roles, name="Staff") or discord.utils.get(guild.roles, name="Security") or await guild.create_role(name="Staff", color=discord.Color.gold())
 
     category = await guild.create_category(
-        "Verification Tickets",
+        "General Ticket",
+        overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+    )
+    male_category = await guild.create_category(
+        "Male Tickets",
+        overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+    )
+    female_category = await guild.create_category(
+        "Female Tickets",
         overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)}
     )
 
-    log_channel = await guild.create_text_channel("verification-logs")
+    log_channel = discord.utils.get(guild.text_channels, name="verification-logs") or await guild.create_text_channel("verification-logs")
     await log_channel.set_permissions(guild.default_role, view_channel=False)
 
     admin_role = discord.utils.get(guild.roles, permissions__administrator=True)
@@ -541,7 +601,7 @@ async def setup(ctx):
             pass
 
     for channel in guild.text_channels:
-        if channel == log_channel or channel.category == category:
+        if channel == log_channel or channel.category in {category, male_category, female_category}:
             continue
         try:
             await channel.set_permissions(male, view_channel=True)
@@ -552,6 +612,9 @@ async def setup(ctx):
     guild_cfg.update({
         "log_channel": log_channel.id,
         "category": category.id,
+        "general_category": category.id,
+        "male_category": male_category.id,
+        "female_category": female_category.id,
         "male_role": male.id,
         "female_role": female.id,
         "unverified_role": unverified.id,
@@ -1774,29 +1837,47 @@ async def auto_kick_if_unverified(member_id, guild_id, delay=600):
 # =========================
 async def ensure_config(guild):
     guild_cfg = get_guild_config(guild.id)
-    if any(v is None for v in guild_cfg.values()):
+
+    male = guild.get_role(guild_cfg.get("male_role")) if guild_cfg.get("male_role") else None
+    female = guild.get_role(guild_cfg.get("female_role")) if guild_cfg.get("female_role") else None
+    unverified = guild.get_role(guild_cfg.get("unverified_role")) if guild_cfg.get("unverified_role") else None
+    staff = guild.get_role(guild_cfg.get("staff_role")) if guild_cfg.get("staff_role") else None
+    log_channel = guild.get_channel(guild_cfg.get("log_channel")) if guild_cfg.get("log_channel") else None
+
+    if not male:
         male = discord.utils.get(guild.roles, name="Male")
+        if male:
+            guild_cfg["male_role"] = male.id
+
+    if not female:
         female = discord.utils.get(guild.roles, name="Female")
+        if female:
+            guild_cfg["female_role"] = female.id
+
+    if not unverified:
         unverified = discord.utils.get(guild.roles, name="Unverified")
-        staff = discord.utils.get(guild.roles, name="Staff")
-        category = discord.utils.get(guild.categories, name="Verification Tickets")
+        if unverified:
+            guild_cfg["unverified_role"] = unverified.id
+
+    if not staff:
+        staff = discord.utils.get(guild.roles, name="Staff") or discord.utils.get(guild.roles, name="Security")
+        if staff:
+            guild_cfg["staff_role"] = staff.id
+
+    if not log_channel:
         log_channel = discord.utils.get(guild.text_channels, name="verification-logs")
-        if all([male, female, unverified, staff, category, log_channel]):
-            guild_cfg.update({
-                "log_channel": log_channel.id,
-                "category": category.id,
-                "male_role": male.id,
-                "female_role": female.id,
-                "unverified_role": unverified.id,
-                "staff_role": staff.id
-            })
-            await save_config_for_guild(guild.id)
-            await log_action(
-                guild,
-                "🛠️ Config Auto-Repaired",
-                "Missing roles/channels were detected and automatically restored.",
-                color=0xFEE75C
-            )
+        if log_channel:
+            guild_cfg["log_channel"] = log_channel.id
+
+    if all([male, female, unverified, staff, log_channel]):
+        await ensure_verification_categories(guild)
+        await save_config_for_guild(guild.id)
+        await log_action(
+            guild,
+            "🛠️ Config Auto-Repaired",
+            "Missing roles/channels were detected and automatically restored.",
+            color=0xFEE75C
+        )
 
 
 # =========================
@@ -1809,8 +1890,9 @@ async def on_member_join(member):
     stats = get_daily_stats(guild.id)
 
     await ensure_config(guild)
+    await ensure_verification_categories(guild)
 
-    if any(v is None for v in guild_cfg.values()):
+    if not ticket_config_ready(guild_cfg):
         print(f"Config not set up for guild {guild.name}, skipping member join.")
         return
 
@@ -1852,7 +1934,7 @@ async def on_member_join(member):
     if unverified:
         await member.add_roles(unverified)
 
-    category = guild.get_channel(guild_cfg["category"])
+    category = guild.get_channel(guild_cfg.get("general_category")) or guild.get_channel(guild_cfg["category"])
     staff_role = guild.get_role(guild_cfg["staff_role"])
 
     overwrites = {
@@ -3115,6 +3197,154 @@ class VerificationPanel(discord.ui.View):
             await self.message.delete()
         except Exception:
             pass
+
+
+class VerificationUserSelect(discord.ui.Select):
+    def __init__(self, panel_view):
+        self.panel_view = panel_view
+        options = []
+        for idx, entry in enumerate(panel_view.rows[:25]):
+            user_id, ticket_id, join_ts, expires_ts, status, gender = entry
+            member = panel_view.guild.get_member(user_id)
+            label = member.display_name if member else f"User {user_id}"
+            description = f"{status} • {gender.capitalize() if gender else 'No gender'}"
+            options.append(discord.SelectOption(label=label[:100], description=description[:100], value=str(idx), emoji="🎫"))
+        if not options:
+            options = [discord.SelectOption(label="No active tickets", value="none")]
+        super().__init__(placeholder="🎯 Select active ticket", min_values=1, max_values=1, options=options, row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            return await interaction.response.send_message("No active tickets.", ephemeral=True)
+        self.panel_view.current_page = int(self.values[0])
+        await self.panel_view._rebuild_selector()
+        await interaction.response.edit_message(embed=self.panel_view.get_embed(), view=self.panel_view)
+
+
+async def _vp_rebuild_selector(self):
+    for item in list(self.children):
+        if isinstance(item, VerificationUserSelect):
+            self.remove_item(item)
+    self.add_item(VerificationUserSelect(self))
+
+
+async def _vp_refresh_rows(self):
+    self.rows = await get_active_verifications(self.guild.id)
+    if self.rows:
+        self.current_page = min(self.current_page, len(self.rows) - 1)
+    else:
+        self.current_page = 0
+    await self._rebuild_selector()
+
+
+def _vp_get_embed(self):
+    total_pages = max(1, len(self.rows))
+    embed = discord.Embed(
+        title=f"Control Room — Verification Console ({self.current_page + 1}/{total_pages})",
+        description=(
+            "Professional staff console\n"
+            "• Row 1: Core moderation + smart actions\n"
+            "• Row 2: Logs + role management\n"
+            "• Row 3: Server controls + power tools"
+        ),
+        color=0x5865F2
+    )
+    embed.timestamp = discord.utils.utcnow()
+
+    entry = self.current_entry()
+    if not entry:
+        embed.description = "✅ No active verifications.\nUse Refresh to check again."
+        return embed
+
+    user_id, ticket_id, join_ts, expires_ts, status, gender = entry
+    member = self.guild.get_member(user_id)
+    username = member.display_name if member else f"Unknown User"
+
+    channel = self.guild.get_channel(ticket_id)
+    ticket_text = channel.mention if channel else f"`{ticket_id}` (missing)"
+    category_name = channel.category.name if channel and channel.category else "Unknown"
+
+    track = ticket_tracking.get(ticket_id, {})
+    expires_value = track.get("expires_timestamp") or expires_ts or int(time.time())
+    time_left = max(0, expires_value - int(time.time()))
+    time_text = format_duration(time_left)
+    if track.get("paused"):
+        time_text += " (paused)"
+
+    gender_icon = "♂️" if gender == "male" else "♀️" if gender == "female" else "❓"
+    claimed_by = track.get("claimed_by")
+    claimed_text = f"<@{claimed_by}>" if claimed_by else "Nobody"
+
+    score = None
+    reasons = []
+    if member:
+        score, reasons = calculate_risk_score(member)
+
+    embed.add_field(
+        name="👤 Selected User",
+        value=(
+            f"{gender_icon} **{username}**\n"
+            f"**ID:** `{user_id}`\n"
+            f"**Ticket:** {ticket_text}\n"
+            f"**Status:** `{status}`\n"
+            f"**Claimed By:** {claimed_text}"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="⏱ Verification State",
+        value=(
+            f"**Time Left:** `{time_text}`\n"
+            f"**Joined:** <t:{join_ts}:R>\n"
+            f"**Gender:** {gender.capitalize() if gender else 'Not selected'}\n"
+            f"**Category:** {category_name}\n"
+            f"**Risk:** `{score if score is not None else 'N/A'}`"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="🧩 Quick Categories",
+        value=(
+            "🔧 Accept / deny / warn / timeout\n"
+            "📜 Logs / audit / export\n"
+            "👑 Roles / pic perms / staff\n"
+            "⚙️ Lockdown / slowmode / power tools"
+        ),
+        inline=False
+    )
+
+    if reasons:
+        embed.add_field(name="⚠️ Risk Reasons", value=", ".join(reasons)[:1024], inline=False)
+
+    if member:
+        embed.set_thumbnail(url=member.display_avatar.url)
+
+    embed.set_footer(text="Select any active ticket from the menu below, then use the action dropdowns")
+    return embed
+
+
+async def _vp_start(self, channel):
+    await self.refresh_rows()
+    self.message = await channel.send(embed=self.get_embed(), view=self)
+    self.update_task = bot.loop.create_task(self.live_update())
+
+
+async def _vp_live_update(self):
+    while not self.is_finished():
+        try:
+            await asyncio.sleep(20)
+            await self.refresh_rows()
+            if self.message:
+                await self.message.edit(embed=self.get_embed(), view=self)
+        except Exception:
+            break
+
+
+VerificationPanel._rebuild_selector = _vp_rebuild_selector
+VerificationPanel.refresh_rows = _vp_refresh_rows
+VerificationPanel.get_embed = _vp_get_embed
+VerificationPanel.start = _vp_start
+VerificationPanel.live_update = _vp_live_update
 
 
 @bot.command()
@@ -5352,10 +5582,21 @@ class GenderButtons(discord.ui.View):
         await update_verification_gender(interaction.user.id, interaction.guild.id, gender)
         req = await get_requirement(gender)
         await ensure_template_seeded(interaction.guild.id)
+        await ensure_verification_categories(interaction.guild)
         template = await get_active_template(interaction.guild.id, gender)
         ensure_ticket_tracking_defaults(interaction.channel.id, interaction.user.id)
         ticket_tracking[interaction.channel.id]["template_name"] = template["label"]
         ticket_tracking[interaction.channel.id]["template_gender"] = gender
+        ticket_tracking[interaction.channel.id]["gender"] = gender
+
+        guild_cfg = get_guild_config(interaction.guild.id)
+        target_category_id = guild_cfg.get("male_category") if gender == "male" else guild_cfg.get("female_category")
+        target_category = interaction.guild.get_channel(target_category_id) if target_category_id else None
+        if target_category and interaction.channel.category != target_category:
+            try:
+                await interaction.channel.edit(category=target_category)
+            except Exception as e:
+                print(f"Failed to move ticket category: {e}")
 
         embed = discord.Embed(
             title=f"{'♂️' if gender == 'male' else '♀️'} Requirements — {gender.capitalize()}",
@@ -5375,6 +5616,7 @@ class GenderButtons(discord.ui.View):
                 ("Gender", gender.capitalize(), True),
                 ("Channel", interaction.channel.mention, True),
                 ("Template", template["label"], True),
+                ("Moved To", target_category.name if target_category else "Unknown", True),
             ]
         )
 
