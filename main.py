@@ -1,4 +1,3 @@
-
 import discord
 
 from discord.ext import commands
@@ -4400,4 +4399,1077 @@ async def _audit_panel_bootstrap():
 # =========================
 # RUN
 # =========================
+
+
+# =========================
+# DASHBOARD / QUEUE / PROOF / TEMPLATE EXPANSION
+# =========================
+import json
+import io
+
+TEMPLATE_PRESETS = {
+    "male": {
+        "standard": {
+            "label": "Standard Male",
+            "questions": [
+                "Who invited you to the server?",
+                "What name or alias do you go by?",
+                "What are you here for?",
+                "Send any proof staff may need if asked."
+            ]
+        },
+        "strict": {
+            "label": "Strict Male",
+            "questions": [
+                "Who invited you and how do you know them?",
+                "What is your main alias on Discord and elsewhere?",
+                "Have you been in similar servers before?",
+                "What do you plan to do in this server?",
+                "Be ready to send stronger proof if staff requests it."
+            ]
+        },
+        "fast": {
+            "label": "Fast Track Male",
+            "questions": [
+                "Who invited you?",
+                "What alias do you use?",
+                "Why do you want in?"
+            ]
+        }
+    },
+    "female": {
+        "standard": {
+            "label": "Standard Female",
+            "questions": [
+                "Who invited you to the server?",
+                "What alias do you go by?",
+                "Why do you want to join?",
+                "Be ready for voice or image proof if staff asks."
+            ]
+        },
+        "strict": {
+            "label": "Strict Female",
+            "questions": [
+                "Who invited you and how do you know them?",
+                "What name or alias do you usually use?",
+                "Have you been in similar communities before?",
+                "Why should staff trust this verification?",
+                "Be ready to provide stronger proof on request."
+            ]
+        },
+        "fast": {
+            "label": "Fast Track Female",
+            "questions": [
+                "Who invited you?",
+                "What alias do you use?",
+                "Why do you want access?"
+            ]
+        }
+    },
+    "general": {
+        "standard": {
+            "label": "Standard General",
+            "questions": [
+                "Answer clearly and one question at a time.",
+                "Do not spam or send fake proof.",
+                "Staff may request more information if needed."
+            ]
+        },
+        "strict": {
+            "label": "Strict General",
+            "questions": [
+                "Provide full answers, not one-word replies.",
+                "Explain how you found the server.",
+                "Be ready for manual review and stronger proof requirements."
+            ]
+        },
+        "fast": {
+            "label": "Fast Track General",
+            "questions": [
+                "Answer fast and clearly.",
+                "Wait for staff after sending your answers."
+            ]
+        }
+    }
+}
+
+PRIORITY_ORDER = {"low": 0, "normal": 1, "medium": 2, "high": 3, "urgent": 4}
+PROOF_STATUS_COLORS = {
+    "unreviewed": 0x5865F2,
+    "pending": 0xFEE75C,
+    "approved": 0x57F287,
+    "rejected": 0xED4245,
+    "voice_requested": 0x9B59B6,
+    "suspicious": 0xED4245,
+}
+
+async def ensure_dashboard_tables():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS verification_templates (
+            guild_id INTEGER,
+            gender TEXT,
+            preset_key TEXT,
+            label TEXT,
+            questions_json TEXT,
+            is_active INTEGER DEFAULT 0,
+            updated_by INTEGER,
+            updated_at INTEGER,
+            PRIMARY KEY (guild_id, gender, preset_key)
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS proof_reviews (
+            guild_id INTEGER,
+            channel_id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            status TEXT,
+            proof_type TEXT,
+            notes TEXT,
+            reviewed_by INTEGER,
+            reviewed_at INTEGER
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_priority (
+            guild_id INTEGER,
+            channel_id INTEGER PRIMARY KEY,
+            priority TEXT,
+            updated_by INTEGER,
+            updated_at INTEGER
+        )
+        """)
+        await db.commit()
+
+async def seed_default_templates_for_guild(guild_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        for gender, presets in TEMPLATE_PRESETS.items():
+            for preset_key, data in presets.items():
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO verification_templates
+                    (guild_id, gender, preset_key, label, questions_json, is_active, updated_by, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        guild_id,
+                        gender,
+                        preset_key,
+                        data["label"],
+                        json.dumps(data["questions"]),
+                        1 if preset_key == "standard" else 0,
+                        0,
+                        int(time.time()),
+                    ),
+                )
+        await db.commit()
+
+async def ensure_template_seeded(guild_id: int):
+    await seed_default_templates_for_guild(guild_id)
+
+async def get_active_template(guild_id: int, gender: str):
+    gender = (gender or "general").lower()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT preset_key, label, questions_json FROM verification_templates WHERE guild_id=? AND gender=? AND is_active=1 LIMIT 1",
+            (guild_id, gender)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "preset_key": row[0],
+                    "label": row[1],
+                    "questions": json.loads(row[2])
+                }
+    preset = TEMPLATE_PRESETS.get(gender, TEMPLATE_PRESETS["general"])["standard"]
+    return {"preset_key": "standard", "label": preset["label"], "questions": preset["questions"]}
+
+async def list_templates_for_gender(guild_id: int, gender: str):
+    gender = (gender or "general").lower()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT preset_key, label, questions_json, is_active FROM verification_templates WHERE guild_id=? AND gender=? ORDER BY preset_key",
+            (guild_id, gender)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    results = []
+    for preset_key, label, questions_json, is_active in rows:
+        results.append({
+            "preset_key": preset_key,
+            "label": label,
+            "questions": json.loads(questions_json),
+            "is_active": bool(is_active),
+        })
+    if not results:
+        for preset_key, data in TEMPLATE_PRESETS.get(gender, TEMPLATE_PRESETS["general"]).items():
+            results.append({
+                "preset_key": preset_key,
+                "label": data["label"],
+                "questions": data["questions"],
+                "is_active": preset_key == "standard",
+            })
+    return results
+
+async def activate_template(guild_id: int, gender: str, preset_key: str, actor_id: int):
+    gender = gender.lower()
+    await ensure_template_seeded(guild_id)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE verification_templates SET is_active=0 WHERE guild_id=? AND gender=?",
+            (guild_id, gender)
+        )
+        preset = TEMPLATE_PRESETS.get(gender, TEMPLATE_PRESETS["general"]).get(preset_key)
+        label = preset["label"] if preset else preset_key.title()
+        questions = preset["questions"] if preset else []
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO verification_templates
+            (guild_id, gender, preset_key, label, questions_json, is_active, updated_by, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (guild_id, gender, preset_key, label, json.dumps(questions), actor_id, int(time.time()))
+        )
+        await db.commit()
+
+async def upsert_custom_template(guild_id: int, gender: str, label: str, questions, actor_id: int, activate_now: bool = True):
+    gender = gender.lower()
+    preset_key = "custom"
+    async with aiosqlite.connect(DB_NAME) as db:
+        if activate_now:
+            await db.execute("UPDATE verification_templates SET is_active=0 WHERE guild_id=? AND gender=?", (guild_id, gender))
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO verification_templates
+            (guild_id, gender, preset_key, label, questions_json, is_active, updated_by, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (guild_id, gender, preset_key, label, json.dumps(questions), 1 if activate_now else 0, actor_id, int(time.time()))
+        )
+        await db.commit()
+
+async def get_ticket_priority(guild_id: int, channel_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT priority FROM ticket_priority WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return row[0]
+    track = ticket_tracking.get(channel_id, {})
+    return track.get("priority", "normal")
+
+async def set_ticket_priority_db(guild_id: int, channel_id: int, priority: str, actor_id: int):
+    priority = priority.lower()
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO ticket_priority (guild_id, channel_id, priority, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (guild_id, channel_id, priority, actor_id, int(time.time()))
+        )
+        await db.commit()
+    if channel_id in ticket_tracking:
+        ticket_tracking[channel_id]["priority"] = priority
+
+async def get_proof_review(guild_id: int, channel_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT status, proof_type, notes, reviewed_by, reviewed_at, user_id FROM proof_reviews WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "status": row[0],
+                    "proof_type": row[1],
+                    "notes": row[2],
+                    "reviewed_by": row[3],
+                    "reviewed_at": row[4],
+                    "user_id": row[5],
+                }
+    return {
+        "status": "unreviewed",
+        "proof_type": "unknown",
+        "notes": "",
+        "reviewed_by": None,
+        "reviewed_at": None,
+        "user_id": ticket_tracking.get(channel_id, {}).get("user_id"),
+    }
+
+async def set_proof_review(guild_id: int, channel_id: int, user_id: int, status: str, proof_type: str, notes: str, actor_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO proof_reviews
+            (guild_id, channel_id, user_id, status, proof_type, notes, reviewed_by, reviewed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (guild_id, channel_id, user_id, status, proof_type, notes, actor_id, int(time.time()))
+        )
+        await db.commit()
+    if channel_id in ticket_tracking:
+        ticket_tracking[channel_id]["proof_status"] = status
+        ticket_tracking[channel_id]["proof_type"] = proof_type
+        ticket_tracking[channel_id]["proof_notes"] = notes
+
+def ensure_ticket_tracking_defaults(channel_id: int, user_id: int | None = None):
+    if channel_id not in ticket_tracking:
+        ticket_tracking[channel_id] = {}
+    data = ticket_tracking[channel_id]
+    if user_id is not None:
+        data.setdefault("user_id", user_id)
+    data.setdefault("claimed_by", None)
+    data.setdefault("status", "open")
+    data.setdefault("priority", "normal")
+    data.setdefault("proof_status", "unreviewed")
+    data.setdefault("proof_type", "unknown")
+    data.setdefault("proof_notes", "")
+    data.setdefault("reminders_sent", [])
+    data.setdefault("template_name", None)
+    data.setdefault("template_gender", None)
+    data.setdefault("created_timestamp", int(time.time()))
+    data.setdefault("attachments", [])
+    data.setdefault("user_msg_count", 0)
+    data.setdefault("staff_msg_count", 0)
+    data.setdefault("followups", 0)
+    return data
+
+async def hydrate_tracking_from_db(guild):
+    rows = await get_active_verifications(guild.id)
+    for user_id, channel_id, join_ts, expires_ts, status, gender in rows:
+        data = ensure_ticket_tracking_defaults(channel_id, user_id)
+        data.setdefault("status", status or "open")
+        data.setdefault("expires_timestamp", expires_ts)
+        data.setdefault("gender", gender)
+        data.setdefault("created_timestamp", join_ts)
+        data["priority"] = await get_ticket_priority(guild.id, channel_id)
+        proof = await get_proof_review(guild.id, channel_id)
+        data["proof_status"] = proof["status"]
+        data["proof_type"] = proof["proof_type"]
+        data["proof_notes"] = proof["notes"] or ""
+
+async def get_sorted_queue_rows(guild_id: int):
+    rows = await get_active_verifications(guild_id)
+    enriched = []
+    for row in rows:
+        user_id, channel_id, join_ts, expires_ts, status, gender = row
+        data = ensure_ticket_tracking_defaults(channel_id, user_id)
+        priority = await get_ticket_priority(guild_id, channel_id)
+        proof = await get_proof_review(guild_id, channel_id)
+        data["priority"] = priority
+        data["proof_status"] = proof["status"]
+        enriched.append((PRIORITY_ORDER.get(priority, 1), join_ts, row))
+    enriched.sort(key=lambda item: (-item[0], item[1]))
+    return [row for _, __, row in enriched]
+
+async def auto_reminder_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        for guild in bot.guilds:
+            rows = await get_active_verifications(guild.id)
+            staff_role = guild.get_role(get_guild_config(guild.id).get("staff_role")) if get_guild_config(guild.id).get("staff_role") else None
+            for user_id, channel_id, join_ts, expires_ts, status, gender in rows:
+                channel = guild.get_channel(channel_id)
+                member = guild.get_member(user_id)
+                if not channel or not member:
+                    continue
+                data = ensure_ticket_tracking_defaults(channel_id, user_id)
+                if data.get("paused"):
+                    continue
+                reminders = set(data.get("reminders_sent", []))
+                now = int(time.time())
+                age = now - int(data.get("created_timestamp", join_ts or now))
+                if age >= 120 and "user_2m" not in reminders and data.get("user_msg_count", 0) == 0:
+                    try:
+                        await channel.send(f"⏰ {member.mention} quick reminder: please answer the verification questions so staff can review you.")
+                    except Exception:
+                        pass
+                    reminders.add("user_2m")
+                    data["followups"] = data.get("followups", 0) + 1
+                if age >= 300 and "user_5m" not in reminders and data.get("user_msg_count", 0) <= 1:
+                    try:
+                        await channel.send(f"⚠️ {member.mention} second reminder: your ticket is still pending. Complete it before the timer ends.")
+                    except Exception:
+                        pass
+                    reminders.add("user_5m")
+                    data["followups"] = data.get("followups", 0) + 1
+                if data.get("last_user_msg") and not data.get("last_staff_msg"):
+                    wait_time = (discord.utils.utcnow() - data["last_user_msg"]).total_seconds()
+                    if wait_time >= 180 and "staff_ping" not in reminders:
+                        try:
+                            if staff_role:
+                                await channel.send(f"📣 {staff_role.mention} this ticket needs a staff response.")
+                            else:
+                                await channel.send("📣 Staff reminder: this ticket needs a response.")
+                        except Exception:
+                            pass
+                        reminders.add("staff_ping")
+                data["reminders_sent"] = list(reminders)
+        await asyncio.sleep(30)
+
+class CustomTemplateModal(discord.ui.Modal, title="Create Custom Verification Template"):
+    label_input = discord.ui.TextInput(label="Template Name", max_length=50, default="Custom Template")
+    q1 = discord.ui.TextInput(label="Question 1", max_length=200)
+    q2 = discord.ui.TextInput(label="Question 2", max_length=200, required=False)
+    q3 = discord.ui.TextInput(label="Question 3", max_length=200, required=False)
+    q4 = discord.ui.TextInput(label="Question 4", style=discord.TextStyle.paragraph, max_length=300, required=False)
+
+    def __init__(self, guild, gender, actor):
+        super().__init__()
+        self.guild = guild
+        self.gender = gender
+        self.actor = actor
+
+    async def on_submit(self, interaction: discord.Interaction):
+        questions = [str(self.q1).strip()]
+        for q in (self.q2, self.q3, self.q4):
+            txt = str(q).strip()
+            if txt:
+                questions.append(txt)
+        await upsert_custom_template(self.guild.id, self.gender, str(self.label_input).strip(), questions, self.actor.id, activate_now=True)
+        await log_action(
+            self.guild,
+            "🧩 Custom Template Saved",
+            f"{self.actor.mention} saved a custom **{self.gender}** template.",
+            color=0x5865F2,
+            fields=[("Template", str(self.label_input)[:100], True), ("Questions", str(len(questions)), True)]
+        )
+        await interaction.response.send_message("✅ Custom template saved and activated.", ephemeral=True)
+
+class QueuePanelView(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.rows = []
+        self.page = 0
+
+    async def refresh_rows(self):
+        self.rows = await get_sorted_queue_rows(self.guild.id)
+        if self.rows:
+            self.page = min(self.page, len(self.rows) - 1)
+        else:
+            self.page = 0
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if not is_staff_member(interaction.user) and interaction.user != self.guild.owner:
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return False
+        return True
+
+    async def current_row(self):
+        if not self.rows:
+            return None
+        return self.rows[self.page]
+
+    async def build_embed(self):
+        await self.refresh_rows()
+        embed = discord.Embed(title="🎫 Queue Panel", color=0x5865F2)
+        embed.description = "Clean live queue sorted by priority first, then oldest ticket."
+        if not self.rows:
+            embed.add_field(name="Status", value="✅ No active tickets.", inline=False)
+            return embed
+        user_id, channel_id, join_ts, expires_ts, status, gender = self.rows[self.page]
+        member = self.guild.get_member(user_id)
+        channel = self.guild.get_channel(channel_id)
+        data = ensure_ticket_tracking_defaults(channel_id, user_id)
+        priority = await get_ticket_priority(self.guild.id, channel_id)
+        proof = await get_proof_review(self.guild.id, channel_id)
+        claimed_by = data.get("claimed_by")
+        time_left = format_duration(max(0, int((data.get("expires_timestamp") or expires_ts or int(time.time())) - time.time())))
+        embed.add_field(name="Ticket", value=channel.mention if channel else f"`{channel_id}`", inline=True)
+        embed.add_field(name="User", value=member.mention if member else f"`{user_id}`", inline=True)
+        embed.add_field(name="Priority", value=priority.title(), inline=True)
+        embed.add_field(name="Status", value=status, inline=True)
+        embed.add_field(name="Gender", value=(gender or "unknown").title(), inline=True)
+        embed.add_field(name="Claimed By", value=f"<@{claimed_by}>" if claimed_by else "Nobody", inline=True)
+        embed.add_field(name="Proof", value=proof["status"].replace("_", " ").title(), inline=True)
+        embed.add_field(name="Attachments", value=str(len(data.get("attachments", []))), inline=True)
+        embed.add_field(name="Time Left", value=time_left, inline=True)
+        embed.add_field(name="User Messages", value=str(data.get("user_msg_count", 0)), inline=True)
+        embed.add_field(name="Staff Messages", value=str(data.get("staff_msg_count", 0)), inline=True)
+        embed.add_field(name="Follow-Ups", value=str(data.get("followups", 0)), inline=True)
+        embed.set_footer(text=f"Ticket {self.page + 1}/{len(self.rows)} • Buttons below keep the queue organized")
+        return embed
+
+    @discord.ui.button(label="⬅", style=discord.ButtonStyle.secondary, row=0)
+    async def prev_btn(self, interaction: discord.Interaction, button):
+        await self.refresh_rows()
+        if self.rows:
+            self.page = (self.page - 1) % len(self.rows)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="➡", style=discord.ButtonStyle.secondary, row=0)
+    async def next_btn(self, interaction: discord.Interaction, button):
+        await self.refresh_rows()
+        if self.rows:
+            self.page = (self.page + 1) % len(self.rows)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="Low", style=discord.ButtonStyle.secondary, row=1)
+    async def low_btn(self, interaction: discord.Interaction, button):
+        await self._set_priority(interaction, "low")
+
+    @discord.ui.button(label="Medium", style=discord.ButtonStyle.primary, row=1)
+    async def med_btn(self, interaction: discord.Interaction, button):
+        await self._set_priority(interaction, "medium")
+
+    @discord.ui.button(label="High", style=discord.ButtonStyle.danger, row=1)
+    async def high_btn(self, interaction: discord.Interaction, button):
+        await self._set_priority(interaction, "high")
+
+    async def _set_priority(self, interaction, priority):
+        row = await self.current_row()
+        if not row:
+            return await interaction.response.send_message("No ticket selected.", ephemeral=True)
+        user_id, channel_id, _, _, _, _ = row
+        await set_ticket_priority_db(self.guild.id, channel_id, priority, interaction.user.id)
+        channel = self.guild.get_channel(channel_id)
+        member = self.guild.get_member(user_id)
+        if channel:
+            try:
+                await channel.send(f"🏷️ Priority updated to **{priority.title()}** by {interaction.user.mention}.")
+            except Exception:
+                pass
+        await log_action(self.guild, "🏷️ Ticket Priority Updated", f"{interaction.user.mention} set {channel.mention if channel else channel_id} to **{priority.title()}**.", color=0x5865F2, fields=[("User", member.mention if member else str(user_id), True), ("Priority", priority.title(), True)])
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, row=2)
+    async def claim_btn(self, interaction: discord.Interaction, button):
+        row = await self.current_row()
+        if not row:
+            return await interaction.response.send_message("No ticket selected.", ephemeral=True)
+        user_id, channel_id, _, _, _, _ = row
+        data = ensure_ticket_tracking_defaults(channel_id, user_id)
+        data["claimed_by"] = interaction.user.id
+        channel = self.guild.get_channel(channel_id)
+        if channel and channel.topic and f"claimed_by:{interaction.user.id}" not in channel.topic:
+            if "claimed_by:" not in channel.topic:
+                try:
+                    await channel.edit(topic=channel.topic + f"|claimed_by:{interaction.user.id}")
+                except Exception:
+                    pass
+        add_staff_stat(self.guild.id, interaction.user.id, "tickets_claimed", 1)
+        await save_staff_stats(self.guild.id, interaction.user.id)
+        await log_action(self.guild, "🛡️ Ticket Claimed (Queue)", f"{interaction.user.mention} claimed {channel.mention if channel else channel_id} from the queue panel.", color=0x57F287)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="Open", style=discord.ButtonStyle.primary, row=2)
+    async def open_btn(self, interaction: discord.Interaction, button):
+        row = await self.current_row()
+        if not row:
+            return await interaction.response.send_message("No ticket selected.", ephemeral=True)
+        _, channel_id, _, _, _, _ = row
+        channel = self.guild.get_channel(channel_id)
+        await interaction.response.send_message(f"Open ticket: {channel.mention if channel else f'`{channel_id}`'}", ephemeral=True)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, row=2)
+    async def refresh_btn(self, interaction: discord.Interaction, button):
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+class StaffPerformancePanelView(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.page = 0
+        self.entries = []
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if not is_staff_member(interaction.user) and interaction.user != self.guild.owner:
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return False
+        return True
+
+    def refresh_entries(self):
+        staff_members = []
+        for (guild_id, staff_id), data in staff_cache.items():
+            if guild_id != self.guild.id:
+                continue
+            score = (
+                data["tickets_claimed"] * 3 +
+                data["tickets_closed"] * 4 +
+                data["approvals"] * 2 +
+                data["denials"] * 2 +
+                data["blacklists"] * 3 +
+                data["proof_requests"] * 1 +
+                data["notes"] * 1 +
+                data["followups"] * 1
+            )
+            staff_members.append((score, staff_id, data))
+        staff_members.sort(key=lambda x: x[0], reverse=True)
+        self.entries = staff_members
+        if self.entries:
+            self.page = min(self.page, len(self.entries) - 1)
+        else:
+            self.page = 0
+
+    async def build_embed(self):
+        self.refresh_entries()
+        embed = discord.Embed(title="📈 Staff Performance Panel", color=0x57F287)
+        embed.description = "Professional performance board with a flashy control-room feel."
+        if not self.entries:
+            embed.add_field(name="Status", value="No staff activity cached yet.", inline=False)
+            return embed
+        score, staff_id, data = self.entries[self.page]
+        member = self.guild.get_member(staff_id)
+        avg_response = (data["total_response_time"] / data["response_events"]) if data["response_events"] else 0.0
+        embed.add_field(name="Staff Member", value=member.mention if member else f"`{staff_id}`", inline=True)
+        embed.add_field(name="Performance Score", value=str(score), inline=True)
+        embed.add_field(name="Avg Response", value=f"{avg_response:.1f}s", inline=True)
+        embed.add_field(name="Claims", value=str(data["tickets_claimed"]), inline=True)
+        embed.add_field(name="Closed", value=str(data["tickets_closed"]), inline=True)
+        embed.add_field(name="Approvals", value=str(data["approvals"]), inline=True)
+        embed.add_field(name="Denials", value=str(data["denials"]), inline=True)
+        embed.add_field(name="Blacklists", value=str(data["blacklists"]), inline=True)
+        embed.add_field(name="Proof Requests", value=str(data["proof_requests"]), inline=True)
+        embed.add_field(name="Notes", value=str(data["notes"]), inline=True)
+        embed.add_field(name="Messages", value=str(data["staff_messages"]), inline=True)
+        embed.add_field(name="Follow-Ups", value=str(data["followups"]), inline=True)
+        embed.set_footer(text=f"Staff {self.page + 1}/{len(self.entries)} • Sorted by live weighted score")
+        return embed
+
+    @discord.ui.button(label="⬅", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button):
+        self.refresh_entries()
+        if self.entries:
+            self.page = (self.page - 1) % len(self.entries)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="➡", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button):
+        self.refresh_entries()
+        if self.entries:
+            self.page = (self.page + 1) % len(self.entries)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary)
+    async def refresh_btn(self, interaction: discord.Interaction, button):
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+class ProofCenterPanelView(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.rows = []
+        self.page = 0
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if not is_staff_member(interaction.user) and interaction.user != self.guild.owner:
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return False
+        return True
+
+    async def refresh_rows(self):
+        rows = await get_active_verifications(self.guild.id)
+        scored = []
+        for row in rows:
+            user_id, channel_id, join_ts, expires_ts, status, gender = row
+            data = ensure_ticket_tracking_defaults(channel_id, user_id)
+            score = len(data.get("attachments", []))
+            scored.append((score, join_ts, row))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        self.rows = [row for _, __, row in scored]
+        if self.rows:
+            self.page = min(self.page, len(self.rows) - 1)
+        else:
+            self.page = 0
+
+    async def current_row(self):
+        if not self.rows:
+            return None
+        return self.rows[self.page]
+
+    async def build_embed(self):
+        await self.refresh_rows()
+        embed = discord.Embed(title="🧾 Proof Center", color=0x5865F2)
+        embed.description = "Review attachments, label proof quality, and keep staff decisions consistent."
+        if not self.rows:
+            embed.add_field(name="Status", value="No active tickets to review.", inline=False)
+            return embed
+        user_id, channel_id, join_ts, expires_ts, status, gender = self.rows[self.page]
+        member = self.guild.get_member(user_id)
+        channel = self.guild.get_channel(channel_id)
+        data = ensure_ticket_tracking_defaults(channel_id, user_id)
+        proof = await get_proof_review(self.guild.id, channel_id)
+        attachment_lines = []
+        for idx, item in enumerate(data.get("attachments", [])[-5:], start=1):
+            ctype, size, added_at = item
+            ts = int(added_at.timestamp()) if hasattr(added_at, 'timestamp') else int(time.time())
+            attachment_lines.append(f"{idx}. `{ctype}` • {size} bytes • <t:{ts}:R>")
+        if not attachment_lines:
+            attachment_lines = ["No attachments logged yet."]
+        embed.color = PROOF_STATUS_COLORS.get(proof["status"], 0x5865F2)
+        embed.add_field(name="Ticket", value=channel.mention if channel else f"`{channel_id}`", inline=True)
+        embed.add_field(name="User", value=member.mention if member else f"`{user_id}`", inline=True)
+        embed.add_field(name="Proof Status", value=proof["status"].replace("_", " ").title(), inline=True)
+        embed.add_field(name="Proof Type", value=(proof["proof_type"] or "unknown").replace("_", " ").title(), inline=True)
+        embed.add_field(name="Notes", value=proof["notes"] or "No review notes yet.", inline=False)
+        embed.add_field(name="Recent Attachments", value="\n".join(attachment_lines)[:1024], inline=False)
+        embed.set_footer(text=f"Proof {self.page + 1}/{len(self.rows)} • Keep reviews clean and consistent")
+        return embed
+
+    async def _mark(self, interaction, status, proof_type, notes):
+        row = await self.current_row()
+        if not row:
+            return await interaction.response.send_message("No proof ticket selected.", ephemeral=True)
+        user_id, channel_id, _, _, _, _ = row
+        await set_proof_review(self.guild.id, channel_id, user_id, status, proof_type, notes, interaction.user.id)
+        channel = self.guild.get_channel(channel_id)
+        member = self.guild.get_member(user_id)
+        if channel:
+            try:
+                await channel.send(f"🧾 Proof review updated to **{status.replace('_', ' ').title()}** by {interaction.user.mention}.")
+            except Exception:
+                pass
+        await log_action(self.guild, "🧾 Proof Review Updated", f"{interaction.user.mention} marked proof for {member.mention if member else user_id} as **{status}**.", color=PROOF_STATUS_COLORS.get(status, 0x5865F2), fields=[("Proof Type", proof_type, True), ("Notes", notes[:250], False)])
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="⬅", style=discord.ButtonStyle.secondary, row=0)
+    async def prev_btn(self, interaction: discord.Interaction, button):
+        await self.refresh_rows()
+        if self.rows:
+            self.page = (self.page - 1) % len(self.rows)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="➡", style=discord.ButtonStyle.secondary, row=0)
+    async def next_btn(self, interaction: discord.Interaction, button):
+        await self.refresh_rows()
+        if self.rows:
+            self.page = (self.page + 1) % len(self.rows)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="Valid", style=discord.ButtonStyle.success, row=1)
+    async def valid_btn(self, interaction: discord.Interaction, button):
+        await self._mark(interaction, "approved", "image_or_document", "Proof looks acceptable.")
+
+    @discord.ui.button(label="Need More", style=discord.ButtonStyle.primary, row=1)
+    async def more_btn(self, interaction: discord.Interaction, button):
+        await self._mark(interaction, "pending", "more_requested", "More proof requested from user.")
+
+    @discord.ui.button(label="Voice", style=discord.ButtonStyle.secondary, row=1)
+    async def voice_btn(self, interaction: discord.Interaction, button):
+        await self._mark(interaction, "voice_requested", "voice_proof", "Voice proof requested.")
+
+    @discord.ui.button(label="Suspicious", style=discord.ButtonStyle.danger, row=1)
+    async def suspicious_btn(self, interaction: discord.Interaction, button):
+        await self._mark(interaction, "suspicious", "edited_or_unclear", "Proof looks suspicious or edited.")
+
+    @discord.ui.button(label="Open", style=discord.ButtonStyle.primary, row=2)
+    async def open_btn(self, interaction: discord.Interaction, button):
+        row = await self.current_row()
+        if not row:
+            return await interaction.response.send_message("No ticket selected.", ephemeral=True)
+        _, channel_id, _, _, _, _ = row
+        channel = self.guild.get_channel(channel_id)
+        await interaction.response.send_message(f"Open ticket: {channel.mention if channel else f'`{channel_id}`'}", ephemeral=True)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, row=2)
+    async def refresh_btn(self, interaction: discord.Interaction, button):
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+class TemplateManagerView(discord.ui.View):
+    def __init__(self, guild, actor):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.actor = actor
+        self.gender = "male"
+        self.page = 0
+        self.templates = []
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if not is_staff_member(interaction.user) and interaction.user != self.guild.owner:
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return False
+        return True
+
+    async def refresh_templates(self):
+        self.templates = await list_templates_for_gender(self.guild.id, self.gender)
+        if self.templates:
+            self.page = min(self.page, len(self.templates) - 1)
+        else:
+            self.page = 0
+
+    async def build_embed(self):
+        await self.refresh_templates()
+        embed = discord.Embed(title="🧩 Verification Templates", color=0x9B59B6)
+        embed.description = "Clean template manager with standard, strict, fast, and custom flows."
+        embed.add_field(name="Current Gender", value=self.gender.title(), inline=True)
+        active = await get_active_template(self.guild.id, self.gender)
+        embed.add_field(name="Active Template", value=active["label"], inline=True)
+        embed.add_field(name="Preset Count", value=str(len(self.templates)), inline=True)
+        if self.templates:
+            tmpl = self.templates[self.page]
+            preview = "\n".join([f"{i+1}. {q}" for i, q in enumerate(tmpl["questions"][:5])]) or "No questions"
+            embed.add_field(name=f"Preview — {tmpl['label']}", value=preview[:1024], inline=False)
+            embed.add_field(name="State", value="✅ Active" if tmpl["is_active"] else "Standby", inline=True)
+            embed.add_field(name="Preset Key", value=tmpl["preset_key"], inline=True)
+            embed.set_footer(text=f"Template {self.page + 1}/{len(self.templates)} • Switch gender or activate a different preset")
+        return embed
+
+    async def _activate(self, interaction, preset_key):
+        await activate_template(self.guild.id, self.gender, preset_key, interaction.user.id)
+        await log_action(self.guild, "🧩 Template Activated", f"{interaction.user.mention} activated **{preset_key}** for **{self.gender}** verification.", color=0x9B59B6)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="Gender", style=discord.ButtonStyle.secondary, row=0)
+    async def gender_btn(self, interaction: discord.Interaction, button):
+        order = ["male", "female", "general"]
+        self.gender = order[(order.index(self.gender) + 1) % len(order)]
+        self.page = 0
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="⬅", style=discord.ButtonStyle.secondary, row=0)
+    async def prev_btn(self, interaction: discord.Interaction, button):
+        await self.refresh_templates()
+        if self.templates:
+            self.page = (self.page - 1) % len(self.templates)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="➡", style=discord.ButtonStyle.secondary, row=0)
+    async def next_btn(self, interaction: discord.Interaction, button):
+        await self.refresh_templates()
+        if self.templates:
+            self.page = (self.page + 1) % len(self.templates)
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="Standard", style=discord.ButtonStyle.success, row=1)
+    async def standard_btn(self, interaction: discord.Interaction, button):
+        await self._activate(interaction, "standard")
+
+    @discord.ui.button(label="Strict", style=discord.ButtonStyle.primary, row=1)
+    async def strict_btn(self, interaction: discord.Interaction, button):
+        await self._activate(interaction, "strict")
+
+    @discord.ui.button(label="Fast", style=discord.ButtonStyle.secondary, row=1)
+    async def fast_btn(self, interaction: discord.Interaction, button):
+        await self._activate(interaction, "fast")
+
+    @discord.ui.button(label="Custom", style=discord.ButtonStyle.danger, row=1)
+    async def custom_btn(self, interaction: discord.Interaction, button):
+        await interaction.response.send_modal(CustomTemplateModal(self.guild, self.gender, interaction.user))
+
+class EverythingDashboardView(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=600)
+        self.guild = guild
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if not is_staff_member(interaction.user) and interaction.user != self.guild.owner:
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return False
+        return True
+
+    async def build_embed(self):
+        rows = await get_active_verifications(self.guild.id)
+        open_count = len(rows)
+        high_priority = 0
+        proof_pending = 0
+        claimed = 0
+        for user_id, channel_id, join_ts, expires_ts, status, gender in rows:
+            priority = await get_ticket_priority(self.guild.id, channel_id)
+            proof = await get_proof_review(self.guild.id, channel_id)
+            data = ensure_ticket_tracking_defaults(channel_id, user_id)
+            if PRIORITY_ORDER.get(priority, 1) >= PRIORITY_ORDER["high"]:
+                high_priority += 1
+            if proof["status"] in {"pending", "voice_requested", "suspicious", "unreviewed"}:
+                proof_pending += 1
+            if data.get("claimed_by"):
+                claimed += 1
+        embed = discord.Embed(title="🖥️ Everything Dashboard", color=0x5865F2)
+        embed.description = (
+            "Clean and flashy staff control center.\n"
+            "• Queue panel\n"
+            "• Staff performance panel\n"
+            "• Better proof center\n"
+            "• Priority management\n"
+            "• Auto-reminder monitoring\n"
+            "• Verification templates"
+        )
+        embed.add_field(name="Open Tickets", value=str(open_count), inline=True)
+        embed.add_field(name="Claimed", value=str(claimed), inline=True)
+        embed.add_field(name="High Priority", value=str(high_priority), inline=True)
+        embed.add_field(name="Proof Pending", value=str(proof_pending), inline=True)
+        embed.add_field(name="Active Staff", value=str(len([1 for (gid, _sid) in staff_cache.keys() if gid == self.guild.id])), inline=True)
+        embed.add_field(name="Auto Reminders", value="Running ✅", inline=True)
+        embed.add_field(name="Quick Launch", value="Use the buttons below to open each panel without clutter.", inline=False)
+        embed.set_footer(text="Dashboard • Clean UI with control-room energy")
+        return embed
+
+    @discord.ui.button(label="Queue", style=discord.ButtonStyle.primary, row=0)
+    async def queue_btn(self, interaction: discord.Interaction, button):
+        view = QueuePanelView(self.guild)
+        await interaction.response.send_message(embed=await view.build_embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="Staff", style=discord.ButtonStyle.success, row=0)
+    async def staff_btn(self, interaction: discord.Interaction, button):
+        view = StaffPerformancePanelView(self.guild)
+        await interaction.response.send_message(embed=await view.build_embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="Proof", style=discord.ButtonStyle.secondary, row=0)
+    async def proof_btn(self, interaction: discord.Interaction, button):
+        view = ProofCenterPanelView(self.guild)
+        await interaction.response.send_message(embed=await view.build_embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="Templates", style=discord.ButtonStyle.secondary, row=1)
+    async def templates_btn(self, interaction: discord.Interaction, button):
+        view = TemplateManagerView(self.guild, interaction.user)
+        await interaction.response.send_message(embed=await view.build_embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="Legacy Panel", style=discord.ButtonStyle.primary, row=1)
+    async def legacy_btn(self, interaction: discord.Interaction, button):
+        rows = await get_active_verifications(self.guild.id)
+        if not rows:
+            return await interaction.response.send_message("✅ No active verifications.", ephemeral=True)
+        view = VerificationPanel(self.guild, rows)
+        control_room = await ensure_control_room(self.guild)
+        await view.start(control_room)
+        await interaction.response.send_message(f"Opened legacy verification panel in {control_room.mention}.", ephemeral=True)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.success, row=1)
+    async def refresh_btn(self, interaction: discord.Interaction, button):
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, row=1)
+    async def close_btn(self, interaction: discord.Interaction, button):
+        await interaction.message.delete()
+
+# Redefine GenderButtons to inject template guidance without removing the old flow.
+class GenderButtons(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.user_id
+
+    @discord.ui.button(label="Male", style=discord.ButtonStyle.primary, emoji="♂️")
+    async def male(self, interaction, button):
+        await self.handle(interaction, "male")
+
+    @discord.ui.button(label="Female", style=discord.ButtonStyle.danger, emoji="♀️")
+    async def female(self, interaction, button):
+        await self.handle(interaction, "female")
+
+    async def handle(self, interaction, gender):
+        await update_verification_gender(interaction.user.id, interaction.guild.id, gender)
+        req = await get_requirement(gender)
+        await ensure_template_seeded(interaction.guild.id)
+        template = await get_active_template(interaction.guild.id, gender)
+        ensure_ticket_tracking_defaults(interaction.channel.id, interaction.user.id)
+        ticket_tracking[interaction.channel.id]["template_name"] = template["label"]
+        ticket_tracking[interaction.channel.id]["template_gender"] = gender
+
+        embed = discord.Embed(
+            title=f"{'♂️' if gender == 'male' else '♀️'} Requirements — {gender.capitalize()}",
+            description=req,
+            color=0x5865F2
+        )
+        await interaction.response.send_message(embed=embed)
+
+        await log_action(
+            interaction.guild,
+            "⚧ Gender Selected",
+            f"{interaction.user.mention} selected **{gender.capitalize()}**.",
+            color=0x5865F2,
+            fields=[
+                ("User", interaction.user.mention, True),
+                ("User ID", str(interaction.user.id), True),
+                ("Gender", gender.capitalize(), True),
+                ("Channel", interaction.channel.mention, True),
+                ("Template", template["label"], True),
+            ]
+        )
+
+        next_steps_embed = discord.Embed(
+            title="Next Steps",
+            description="Answer the questions below. Staff will review shortly.",
+            color=0x2b2d31
+        )
+        template_embed = discord.Embed(
+            title=f"🧩 Active Verification Template — {template['label']}",
+            description="\n".join([f"**{i+1}.** {q}" for i, q in enumerate(template["questions"])]),
+            color=0x9B59B6
+        )
+        template_embed.set_footer(text="Clean template routing is now active for this ticket")
+
+        await interaction.channel.send(embed=next_steps_embed)
+        await interaction.channel.send(embed=template_embed)
+        await interaction.channel.send("🎫 Staff Controls:", view=TicketControls(self.user_id, gender))
+
+@bot.command(name="dashboard")
+async def dashboard_command(ctx):
+    if not is_staff_member(ctx.author) and ctx.author != ctx.guild.owner:
+        return await ctx.send("Staff only.")
+    control_room = await ensure_control_room(ctx.guild)
+    view = EverythingDashboardView(ctx.guild)
+    await control_room.send(embed=await view.build_embed(), view=view)
+    await ctx.send(f"{ctx.author.mention} dashboard sent to {control_room.mention}.")
+
+@bot.command(name="queuepanel")
+async def queuepanel_command(ctx):
+    if not is_staff_member(ctx.author) and ctx.author != ctx.guild.owner:
+        return await ctx.send("Staff only.")
+    view = QueuePanelView(ctx.guild)
+    await ctx.send(embed=await view.build_embed(), view=view)
+
+@bot.command(name="staffpanel")
+async def staffpanel_command(ctx):
+    if not is_staff_member(ctx.author) and ctx.author != ctx.guild.owner:
+        return await ctx.send("Staff only.")
+    view = StaffPerformancePanelView(ctx.guild)
+    await ctx.send(embed=await view.build_embed(), view=view)
+
+@bot.command(name="proofcenter")
+async def proofcenter_command(ctx):
+    if not is_staff_member(ctx.author) and ctx.author != ctx.guild.owner:
+        return await ctx.send("Staff only.")
+    view = ProofCenterPanelView(ctx.guild)
+    await ctx.send(embed=await view.build_embed(), view=view)
+
+@bot.command(name="templates")
+async def templates_command(ctx, gender: str | None = None, preset: str | None = None):
+    if not is_staff_member(ctx.author) and ctx.author != ctx.guild.owner:
+        return await ctx.send("Staff only.")
+    await ensure_template_seeded(ctx.guild.id)
+    if gender and preset:
+        gender = gender.lower()
+        preset = preset.lower()
+        valid = TEMPLATE_PRESETS.get(gender)
+        if not valid or preset not in valid and preset != "custom":
+            return await ctx.send("Use genders: male, female, general and presets: standard, strict, fast.")
+        if preset != "custom":
+            await activate_template(ctx.guild.id, gender, preset, ctx.author.id)
+            await log_action(ctx.guild, "🧩 Template Activated", f"{ctx.author.mention} activated **{preset}** for **{gender}** via command.", color=0x9B59B6)
+            return await ctx.send(f"✅ Activated **{preset}** for **{gender}** verification.")
+    view = TemplateManagerView(ctx.guild, ctx.author)
+    if gender and gender.lower() in {"male", "female", "general"}:
+        view.gender = gender.lower()
+    await ctx.send(embed=await view.build_embed(), view=view)
+
+# Override on_ready to include the new systems without removing existing startup work.
+@bot.event
+async def on_ready():
+    await init_db()
+    await ensure_dashboard_tables()
+    await load_config()
+    await load_staff_stats()
+
+    for guild in bot.guilds:
+        await ensure_config(guild)
+        await ensure_control_room(guild)
+        await ensure_template_seeded(guild.id)
+        await hydrate_tracking_from_db(guild)
+        await log_action(
+            guild,
+            "🟣 Bot Started",
+            f"Bot is online and connected to **{guild.name}**.",
+            color=0x9B59B6
+        )
+
+    bot.loop.create_task(staff_inactivity_check())
+    bot.loop.create_task(daily_summary())
+    bot.loop.create_task(ticket_timeout_checker())
+    bot.loop.create_task(auto_reminder_loop())
+
+    print(f"Logged in as {bot.user}")
+    print(f"Loaded config: {config}")
+
 bot.run(os.getenv("TOKEN"))
