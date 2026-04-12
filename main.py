@@ -2593,6 +2593,10 @@ class ActionSelect(discord.ui.Select):
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
         await self.parent_view.handle_panel_action(interaction, self.values[0])
 
 
@@ -2875,8 +2879,21 @@ class VerificationPanel(discord.ui.View):
 
     async def _panel_feedback(self, interaction, msg):
         await self.refresh_rows()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-        await interaction.followup.send(msg, ephemeral=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=self.get_embed(), view=self)
+            else:
+                await interaction.edit_original_response(embed=self.get_embed(), view=self)
+        except Exception:
+            try:
+                if self.message:
+                    await self.message.edit(embed=self.get_embed(), view=self)
+            except Exception:
+                pass
+        try:
+            await interaction.followup.send(msg, ephemeral=True)
+        except Exception:
+            pass
 
     async def handle_panel_action(self, interaction, action: str):
         entry, member, channel, user_id, ticket_id, gender = await self._selected()
@@ -5478,7 +5495,7 @@ class TemplateManagerView(discord.ui.View):
 
 class EverythingDashboardView(discord.ui.View):
     def __init__(self, guild):
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.guild = guild
 
     async def interaction_check(self, interaction: discord.Interaction):
@@ -5789,7 +5806,8 @@ class DashboardTicketSelect(discord.ui.Select):
             options=options,
             row=0,
             min_values=1,
-            max_values=1
+            max_values=1,
+            custom_id="maxlive_dashboard_ticket_select"
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -5797,12 +5815,22 @@ class DashboardTicketSelect(discord.ui.Select):
             return await interaction.response.send_message("✅ No active tickets.", ephemeral=True)
         self.dashboard_view.current_index = int(self.values[0])
         await self.dashboard_view.refresh_rows()
-        await interaction.response.edit_message(embed=await self.dashboard_view.build_embed(), view=self.dashboard_view)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=await self.dashboard_view.build_embed(), view=self.dashboard_view)
+            else:
+                await interaction.edit_original_response(embed=await self.dashboard_view.build_embed(), view=self.dashboard_view)
+        except Exception:
+            try:
+                if self.dashboard_view.message:
+                    await self.dashboard_view.message.edit(embed=await self.dashboard_view.build_embed(), view=self.dashboard_view)
+            except Exception:
+                pass
 
 
 class AdvancedDashboardView(discord.ui.View):
     def __init__(self, guild, opener=None):
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.guild = guild
         self.opener = opener
         self.rows = []
@@ -5955,7 +5983,17 @@ class AdvancedDashboardView(discord.ui.View):
         return embed
 
     async def _panel_feedback(self, interaction, message):
-        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+            else:
+                await interaction.edit_original_response(embed=await self.build_embed(), view=self)
+        except Exception:
+            try:
+                if self.message:
+                    await self.message.edit(embed=await self.build_embed(), view=self)
+            except Exception:
+                pass
         try:
             await interaction.followup.send(message, ephemeral=True)
         except Exception:
@@ -6378,7 +6416,17 @@ class MaxLiveAdminPanelView(AdvancedDashboardView):
         return embed
 
     async def _panel_feedback(self, interaction, message):
-        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+            else:
+                await interaction.edit_original_response(embed=await self.build_embed(), view=self)
+        except Exception:
+            try:
+                if self.message:
+                    await self.message.edit(embed=await self.build_embed(), view=self)
+            except Exception:
+                pass
         try:
             await interaction.followup.send(message, ephemeral=True)
         except Exception:
