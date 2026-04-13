@@ -5731,31 +5731,6 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     print(f"Loaded config: {config}")
 
-bot.run(os.getenv("TOKEN"))
-
-# =========================
-# PATCH FIXES (AUTO APPLIED)
-# =========================
-
-@bot.event
-async def on_guild_channel_update(before, after):
-    if isinstance(before, discord.TextChannel) and isinstance(after, discord.TextChannel):
-        if before.slowmode_delay != after.slowmode_delay:
-            pass
-
-@bot.event
-async def on_member_join(member):
-    guild = member.guild
-    pic_role = guild.get_role(PIC_PERMS_ROLE_ID)
-    if pic_role:
-        try:
-            await member.add_roles(pic_role)
-        except:
-            pass
-
-
-
-
 # =========================
 # ADVANCED LIVE DASHBOARD OVERRIDE
 # =========================
@@ -5806,8 +5781,7 @@ class DashboardTicketSelect(discord.ui.Select):
             options=options,
             row=0,
             min_values=1,
-            max_values=1,
-            custom_id="maxlive_dashboard_ticket_select"
+            max_values=1
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -5815,22 +5789,12 @@ class DashboardTicketSelect(discord.ui.Select):
             return await interaction.response.send_message("✅ No active tickets.", ephemeral=True)
         self.dashboard_view.current_index = int(self.values[0])
         await self.dashboard_view.refresh_rows()
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.edit_message(embed=await self.dashboard_view.build_embed(), view=self.dashboard_view)
-            else:
-                await interaction.edit_original_response(embed=await self.dashboard_view.build_embed(), view=self.dashboard_view)
-        except Exception:
-            try:
-                if self.dashboard_view.message:
-                    await self.dashboard_view.message.edit(embed=await self.dashboard_view.build_embed(), view=self.dashboard_view)
-            except Exception:
-                pass
+        await interaction.response.edit_message(embed=await self.dashboard_view.build_embed(), view=self.dashboard_view)
 
 
 class AdvancedDashboardView(discord.ui.View):
     def __init__(self, guild, opener=None):
-        super().__init__(timeout=None)
+        super().__init__(timeout=600)
         self.guild = guild
         self.opener = opener
         self.rows = []
@@ -5852,7 +5816,7 @@ class AdvancedDashboardView(discord.ui.View):
     async def live_update(self):
         while not self.is_finished():
             try:
-                await asyncio.sleep(5)
+                await asyncio.sleep(20)
                 if self.message:
                     await self.refresh_rows()
                     await self.message.edit(embed=await self.build_embed(), view=self)
@@ -5932,7 +5896,7 @@ class AdvancedDashboardView(discord.ui.View):
             except Exception:
                 pass
 
-        embed = discord.Embed(title="🚀 Maximum Live Verification Dashboard", color=0x5865F2)
+        embed = discord.Embed(title="🎛️ Advanced Verification Dashboard", color=0x5865F2)
         embed.description = (
             "Live staff control center. Switch users anytime from the dropdown, run actions instantly, "
             "and open dedicated panels without losing your place."
@@ -5983,17 +5947,7 @@ class AdvancedDashboardView(discord.ui.View):
         return embed
 
     async def _panel_feedback(self, interaction, message):
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.edit_message(embed=await self.build_embed(), view=self)
-            else:
-                await interaction.edit_original_response(embed=await self.build_embed(), view=self)
-        except Exception:
-            try:
-                if self.message:
-                    await self.message.edit(embed=await self.build_embed(), view=self)
-            except Exception:
-                pass
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
         try:
             await interaction.followup.send(message, ephemeral=True)
         except Exception:
@@ -6265,7 +6219,7 @@ except Exception:
     pass
 
 
-@bot.command(name="dashboard_advanced_disabled")
+@bot.command(name="dashboard")
 async def advanced_dashboard_command(ctx):
     if not _dashboard_is_staff(ctx.author):
         return await ctx.send("Staff only.")
@@ -6275,7 +6229,7 @@ async def advanced_dashboard_command(ctx):
     await ctx.send(f"{ctx.author.mention} advanced dashboard opened in {control_room.mention}.")
 
 
-@bot.command(name="adminpanel_advanced_disabled")
+@bot.command(name="adminpanel")
 async def advanced_adminpanel_command(ctx):
     if ctx.author != ctx.guild.owner and not _dashboard_is_staff(ctx.author):
         return await ctx.send("Staff only.")
@@ -6284,264 +6238,4 @@ async def advanced_adminpanel_command(ctx):
     await view.start(control_room)
     await ctx.send(f"{ctx.author.mention} advanced admin panel opened in {control_room.mention}.")
 
-
-# =========================
-# MAX REBUILD PATCH
-# =========================
-async def auto_kick_if_unverified(member_id, guild_id, delay=600):
-    """Patched timeout that truly respects pause state and stops once verification ends."""
-    end_at = time.time() + delay
-    while True:
-        guild = bot.get_guild(guild_id)
-        if not guild:
-            return
-        member = guild.get_member(member_id)
-        if not member:
-            return
-
-        rows = await get_active_verifications(guild_id)
-        row = next((r for r in rows if r[0] == member_id), None)
-        if not row:
-            return
-
-        _user_id, channel_id, _join_ts, _expires_ts, _status, _gender = row
-        data = ensure_ticket_tracking_defaults(channel_id, member_id)
-
-        if data.get("paused"):
-            await asyncio.sleep(5)
-            end_at += 5
-            continue
-
-        remaining = end_at - time.time()
-        if remaining <= 0:
-            break
-        await asyncio.sleep(min(5, max(1, remaining)))
-
-    guild = bot.get_guild(guild_id)
-    if not guild:
-        return
-    member = guild.get_member(member_id)
-    if not member:
-        return
-
-    guild_cfg = get_guild_config(guild.id)
-    stats = get_daily_stats(guild.id)
-    unverified_role = guild.get_role(guild_cfg["unverified_role"]) if guild_cfg.get("unverified_role") else None
-    if unverified_role and unverified_role in member.roles:
-        try:
-            await member.send("⏰ You did not complete verification in time and were removed from the server.")
-        except Exception:
-            pass
-        try:
-            await member.kick(reason="Verification timeout")
-        except Exception:
-            return
-        stats["autokicked"] += 1
-        await log_action(
-            guild,
-            "⏰ Auto-Kicked (Timeout)",
-            f"{member.mention} was auto-kicked for not completing verification in time.",
-            color=0xED4245,
-            fields=[
-                ("User", member.mention, True),
-                ("User ID", str(member.id), True),
-                ("Reason", "Verification timeout", True),
-            ],
-        )
-        await remove_from_verification(member_id, guild_id)
-
-
-class MaxLiveDashboardView(AdvancedDashboardView):
-    async def live_update(self):
-        while not self.is_finished():
-            try:
-                await asyncio.sleep(5)
-                if self.message:
-                    await self.refresh_rows()
-                    await self.message.edit(embed=await self.build_embed(), view=self)
-            except Exception:
-                break
-
-    async def build_embed(self):
-        embed = await super().build_embed()
-        embed.title = "🚀 Maximum Live Dashboard"
-        embed.description = (
-            "Fully live command center. Select any active verification from the dropdown, "
-            "run actions instantly, and monitor queue, proof, and risk in one place."
-        )
-        if embed.fields:
-            for field in embed.fields:
-                if field.name == "Auto Refresh":
-                    field.value = "5s • Fully Live"
-        embed.set_footer(text="Dashboard • fully live • select a user from the dropdown to control them")
-        return embed
-
-
-class MaxLiveAdminPanelView(AdvancedDashboardView):
-    async def live_update(self):
-        while not self.is_finished():
-            try:
-                await asyncio.sleep(5)
-                if self.message:
-                    await self.refresh_rows()
-                    await self.message.edit(embed=await self.build_embed(), view=self)
-            except Exception:
-                break
-
-    async def build_embed(self):
-        embed = await super().build_embed()
-        embed.title = "🛡️ Hybrid Live Admin Panel"
-        embed.description = (
-            "Select a user that is currently verifying from the dropdown, then use the buttons below "
-            "to claim, approve, deny, blacklist, review logs, manage proof, and jump into the ticket instantly."
-        )
-        if embed.fields:
-            for field in embed.fields:
-                if field.name == "Auto Refresh":
-                    field.value = "5s • Fully Live"
-        ctx = await self.current_context()
-        if not ctx:
-            embed.set_footer(text="Admin Panel • fully live • waiting for active verifications")
-            return embed
-
-        member = ctx["member"]
-        channel = ctx["channel"]
-        data = ctx["data"]
-        role = self.guild.get_role(PIC_PERMS_ROLE_ID)
-        has_pic = bool(member and role and role in member.roles)
-        embed.add_field(name="Pic Perms", value="Enabled ✅" if has_pic else "Disabled ❌", inline=True)
-        embed.add_field(name="Open Ticket", value=channel.mention if channel else "Missing", inline=True)
-        embed.add_field(name="Actions", value="Claim • Approve • Deny • Blacklist • Logs • Proof • Priority", inline=False)
-        embed.set_footer(text="Admin Panel • fully live • choose active verifier from dropdown, then use buttons")
-        return embed
-
-    async def _panel_feedback(self, interaction, message):
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.edit_message(embed=await self.build_embed(), view=self)
-            else:
-                await interaction.edit_original_response(embed=await self.build_embed(), view=self)
-        except Exception:
-            try:
-                if self.message:
-                    await self.message.edit(embed=await self.build_embed(), view=self)
-            except Exception:
-                pass
-        try:
-            await interaction.followup.send(message, ephemeral=True)
-        except Exception:
-            pass
-
-    @discord.ui.button(label="📸 Pic Perms", style=discord.ButtonStyle.secondary, row=0)
-    async def pic_perms_btn(self, interaction: discord.Interaction, button):
-        ctx, member, _channel = await self._selected_member_channel()
-        if not ctx or not member:
-            return await interaction.response.send_message("No active user selected.", ephemeral=True)
-        role = self.guild.get_role(PIC_PERMS_ROLE_ID)
-        if not role:
-            return await interaction.response.send_message("Pic perms role is missing.", ephemeral=True)
-        try:
-            if role in member.roles:
-                await member.remove_roles(role)
-                await log_action(self.guild, "📸 Pic Perms Removed", f"{interaction.user.mention} removed pic perms from {member.mention}.", color=0xFEE75C)
-                return await self._panel_feedback(interaction, "📸 Pic perms removed.")
-            await member.add_roles(role)
-            await log_action(self.guild, "📸 Pic Perms Granted", f"{interaction.user.mention} granted pic perms to {member.mention}.", color=0x57F287)
-            return await self._panel_feedback(interaction, "📸 Pic perms granted.")
-        except Exception as e:
-            return await interaction.response.send_message(f"Failed to update pic perms: {e}", ephemeral=True)
-
-    @discord.ui.button(label="⏸️ Pause", style=discord.ButtonStyle.secondary, row=0)
-    async def pause_btn(self, interaction: discord.Interaction, button):
-        ctx, _member, channel = await self._selected_member_channel()
-        if not ctx or not channel:
-            return await interaction.response.send_message("No active ticket selected.", ephemeral=True)
-        ok, msg = await pause_ticket_timer(self.guild, channel, interaction.user)
-        if ok:
-            await self._panel_feedback(interaction, msg)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-
-    @discord.ui.button(label="▶️ Resume", style=discord.ButtonStyle.success, row=0)
-    async def resume_btn(self, interaction: discord.Interaction, button):
-        ctx, _member, channel = await self._selected_member_channel()
-        if not ctx or not channel:
-            return await interaction.response.send_message("No active ticket selected.", ephemeral=True)
-        ok, msg = await resume_ticket_timer(self.guild, channel, interaction.user)
-        if ok:
-            await self._panel_feedback(interaction, msg)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-
-    @discord.ui.button(label="⬅️ Prev", style=discord.ButtonStyle.secondary, row=0)
-    async def prev_btn(self, interaction: discord.Interaction, button):
-        if self.rows:
-            self.current_index = (self.current_index - 1) % len(self.rows)
-        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
-
-    @discord.ui.button(label="➡️ Next", style=discord.ButtonStyle.secondary, row=0)
-    async def next_btn(self, interaction: discord.Interaction, button):
-        if self.rows:
-            self.current_index = (self.current_index + 1) % len(self.rows)
-        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
-
-
-
-async def _cleanup_control_room_panels(channel, *, dashboard=False, admin=False):
-    try:
-        async for msg in channel.history(limit=50):
-            if msg.author != bot.user or not msg.embeds:
-                continue
-            title = (msg.embeds[0].title or "")
-            if dashboard and title in {
-                "🖥️ Everything Dashboard",
-                "🚀 Maximum Live Verification Dashboard",
-                "🚀 Maximum Potential Dashboard",
-            }:
-                try:
-                    await msg.delete()
-                except Exception:
-                    pass
-            if admin and title in {
-                "🛡️ Hybrid Live Admin Panel",
-                "Control Room — Verification Console (1/9)",
-                "Control Room",
-            }:
-                try:
-                    await msg.delete()
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-try:
-    bot.remove_command("dashboard")
-except Exception:
-    pass
-
-try:
-    bot.remove_command("adminpanel")
-except Exception:
-    pass
-
-
-@bot.command(name="dashboard")
-async def maximum_dashboard_command(ctx):
-    if not _dashboard_is_staff(ctx.author):
-        return await ctx.send("Staff only.")
-    control_room = await ensure_control_room(ctx.guild)
-    await _cleanup_control_room_panels(control_room, dashboard=True, admin=False)
-    view = MaxLiveDashboardView(ctx.guild, opener=ctx.author)
-    await view.start(control_room)
-    await ctx.send(f"{ctx.author.mention} maximum dashboard opened in {control_room.mention}.")
-
-
-@bot.command(name="adminpanel")
-async def maximum_adminpanel_command(ctx):
-    if ctx.author != ctx.guild.owner and not _dashboard_is_staff(ctx.author):
-        return await ctx.send("Staff only.")
-    control_room = await ensure_control_room(ctx.guild)
-    await _cleanup_control_room_panels(control_room, dashboard=False, admin=True)
-    view = MaxLiveAdminPanelView(ctx.guild, opener=ctx.author)
-    await view.start(control_room)
-    await ctx.send(f"{ctx.author.mention} hybrid admin panel opened in {control_room.mention}.")
+bot.run(os.getenv("TOKEN"))
