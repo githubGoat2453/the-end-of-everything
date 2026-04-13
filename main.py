@@ -5653,7 +5653,7 @@ class GenderButtons(discord.ui.View):
         await interaction.channel.send(embed=template_embed)
         await interaction.channel.send("🎫 Staff Controls:", view=TicketControls(self.user_id, gender))
 
-@bot.command(name="dashboard")
+@bot.command(name="dashboard_legacy_disabled")
 async def dashboard_command(ctx):
     if not is_staff_member(ctx.author) and ctx.author != ctx.guild.owner:
         return await ctx.send("Staff only.")
@@ -6265,7 +6265,7 @@ except Exception:
     pass
 
 
-@bot.command(name="dashboard")
+@bot.command(name="dashboard_advanced_disabled")
 async def advanced_dashboard_command(ctx):
     if not _dashboard_is_staff(ctx.author):
         return await ctx.send("Staff only.")
@@ -6275,7 +6275,7 @@ async def advanced_dashboard_command(ctx):
     await ctx.send(f"{ctx.author.mention} advanced dashboard opened in {control_room.mention}.")
 
 
-@bot.command(name="adminpanel")
+@bot.command(name="adminpanel_advanced_disabled")
 async def advanced_adminpanel_command(ctx):
     if ctx.author != ctx.guild.owner and not _dashboard_is_staff(ctx.author):
         return await ctx.send("Staff only.")
@@ -6364,7 +6364,7 @@ class MaxLiveDashboardView(AdvancedDashboardView):
 
     async def build_embed(self):
         embed = await super().build_embed()
-        embed.title = "🚀 Maximum Potential Dashboard"
+        embed.title = "🚀 Maximum Live Dashboard"
         embed.description = (
             "Fully live command center. Select any active verification from the dropdown, "
             "run actions instantly, and monitor queue, proof, and risk in one place."
@@ -6486,6 +6486,34 @@ class MaxLiveAdminPanelView(AdvancedDashboardView):
         await interaction.response.edit_message(embed=await self.build_embed(), view=self)
 
 
+
+async def _cleanup_control_room_panels(channel, *, dashboard=False, admin=False):
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.author != bot.user or not msg.embeds:
+                continue
+            title = (msg.embeds[0].title or "")
+            if dashboard and title in {
+                "🖥️ Everything Dashboard",
+                "🚀 Maximum Live Verification Dashboard",
+                "🚀 Maximum Potential Dashboard",
+            }:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            if admin and title in {
+                "🛡️ Hybrid Live Admin Panel",
+                "Control Room — Verification Console (1/9)",
+                "Control Room",
+            }:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 try:
     bot.remove_command("dashboard")
 except Exception:
@@ -6502,9 +6530,10 @@ async def maximum_dashboard_command(ctx):
     if not _dashboard_is_staff(ctx.author):
         return await ctx.send("Staff only.")
     control_room = await ensure_control_room(ctx.guild)
+    await _cleanup_control_room_panels(control_room, dashboard=True, admin=False)
     view = MaxLiveDashboardView(ctx.guild, opener=ctx.author)
     await view.start(control_room)
-    await ctx.send(f"{ctx.author.mention} live dashboard opened in {control_room.mention}.")
+    await ctx.send(f"{ctx.author.mention} maximum dashboard opened in {control_room.mention}.")
 
 
 @bot.command(name="adminpanel")
@@ -6512,6 +6541,7 @@ async def maximum_adminpanel_command(ctx):
     if ctx.author != ctx.guild.owner and not _dashboard_is_staff(ctx.author):
         return await ctx.send("Staff only.")
     control_room = await ensure_control_room(ctx.guild)
+    await _cleanup_control_room_panels(control_room, dashboard=False, admin=True)
     view = MaxLiveAdminPanelView(ctx.guild, opener=ctx.author)
     await view.start(control_room)
-    await ctx.send(f"{ctx.author.mention} live admin panel opened in {control_room.mention}.")
+    await ctx.send(f"{ctx.author.mention} hybrid admin panel opened in {control_room.mention}.")
