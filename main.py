@@ -6224,7 +6224,7 @@ async def advanced_dashboard_command(ctx):
     if not _dashboard_is_staff(ctx.author):
         return await ctx.send("Staff only.")
     control_room = await ensure_control_room(ctx.guild)
-    view = AdvancedDashboardView(ctx.guild, opener=ctx.author)
+    view = MaxLiveDashboardView(ctx.guild, opener=ctx.author)
     await view.start(control_room)
     await ctx.send(f"{ctx.author.mention} advanced dashboard opened in {control_room.mention}.")
 
@@ -6234,7 +6234,7 @@ async def advanced_adminpanel_command(ctx):
     if ctx.author != ctx.guild.owner and not _dashboard_is_staff(ctx.author):
         return await ctx.send("Staff only.")
     control_room = await ensure_control_room(ctx.guild)
-    view = AdvancedDashboardView(ctx.guild, opener=ctx.author)
+    view = MaxLiveAdminPanelView(ctx.guild, opener=ctx.author)
     await view.start(control_room)
     await ctx.send(f"{ctx.author.mention} advanced admin panel opened in {control_room.mention}.")
 
