@@ -6238,4 +6238,327 @@ async def advanced_adminpanel_command(ctx):
     await view.start(control_room)
     await ctx.send(f"{ctx.author.mention} advanced admin panel opened in {control_room.mention}.")
 
+# =========================
+# FINAL COMMAND + TIMER FIX OVERRIDES
+# =========================
+# These overrides keep the existing bot intact, but guarantee the live dashboard
+# commands register before bot.run(), and make timeout kicks respect paused tickets.
+
+async def auto_kick_if_unverified(member_id, guild_id, delay=600):
+    # Pause-aware timeout checker.
+    # It does NOT kick while the ticket is paused. It waits until the ticket is resumed
+    # and the effective expires_timestamp has actually passed.
+    while True:
+        await asyncio.sleep(5)
+
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            return
+
+        member = guild.get_member(member_id)
+        if not member:
+            return
+
+        guild_cfg = get_guild_config(guild.id)
+        unverified_role = guild.get_role(guild_cfg["unverified_role"]) if guild_cfg.get("unverified_role") else None
+        if not unverified_role or unverified_role not in member.roles:
+            return
+
+        ticket_channel_id = None
+        db_expires_ts = None
+
+        try:
+            async with aiosqlite.connect(DB_NAME) as db:
+                async with db.execute(
+                    "SELECT ticket_channel_id, expires_timestamp FROM active_verifications WHERE user_id=? AND guild_id=?",
+                    (member_id, guild_id)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        ticket_channel_id, db_expires_ts = row
+        except Exception as e:
+            print(f"Pause-aware timeout DB lookup error: {e}")
+
+        data = ticket_tracking.get(ticket_channel_id, {}) if ticket_channel_id else {}
+
+        if data.get("paused"):
+            # While paused, do nothing.
+            continue
+
+        expires_ts = data.get("expires_timestamp") or db_expires_ts or (int(time.time()) + 1)
+
+        if time.time() < expires_ts:
+            continue
+
+        stats = get_daily_stats(guild.id)
+
+        try:
+            await member.send("⏰ You did not complete verification in time and were removed from the server.")
+        except Exception:
+            pass
+
+        try:
+            await member.kick(reason="Verification timeout")
+        except Exception as e:
+            print(f"Timeout kick failed: {e}")
+            return
+
+        stats["autokicked"] += 1
+
+        await log_action(
+            guild,
+            "⏰ Auto-Kicked (Timeout)",
+            f"{member.mention} was auto-kicked for not completing verification in time.",
+            color=0xED4245,
+            fields=[
+                ("User", member.mention, True),
+                ("User ID", str(member.id), True),
+                ("Reason", "Verification timeout", True)
+            ]
+        )
+
+        await remove_from_verification(member_id, guild_id)
+        return
+
+
+try:
+    bot.remove_command("dashboard")
+except Exception:
+    pass
+
+try:
+    bot.remove_command("adminpanel")
+except Exception:
+    pass
+
+try:
+    bot.remove_command("maximumdashboard")
+except Exception:
+    pass
+
+
+@bot.command(name="dashboard", aliases=["maximumdashboard", "maxdashboard"])
+async def final_dashboard_command(ctx):
+    if not _dashboard_is_staff(ctx.author):
+        return await ctx.send("Staff only.")
+
+    control_room = await ensure_control_room(ctx.guild)
+    view = AdvancedDashboardView(ctx.guild, opener=ctx.author)
+    await view.start(control_room)
+    await ctx.send(f"{ctx.author.mention} advanced dashboard opened in {control_room.mention}.")
+
+
+@bot.command(name="adminpanel")
+async def final_adminpanel_command(ctx):
+    if ctx.author != ctx.guild.owner and not _dashboard_is_staff(ctx.author):
+        return await ctx.send("Staff only.")
+
+    control_room = await ensure_control_room(ctx.guild)
+    view = AdvancedDashboardView(ctx.guild, opener=ctx.author)
+    await view.start(control_room)
+    await ctx.send(f"{ctx.author.mention} advanced admin panel opened in {control_room.mention}.")
+
+# =========================
+# FINAL PAUSE-AWARE TIMER OVERRIDES
+# =========================
+# This makes paused tickets pause for real:
+# - pause stores remaining time
+# - pause writes "paused" into the DB
+# - timeout task will NOT kick while paused
+# - resume rebuilds the expiry time from the saved remaining time
+# - resume writes the new expires_timestamp into the DB
+
+async def _set_active_verification_status(guild_id, user_id, status=None, expires_timestamp=None):
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            if status is not None and expires_timestamp is not None:
+                await db.execute(
+                    "UPDATE active_verifications SET status=?, expires_timestamp=? WHERE guild_id=? AND user_id=?",
+                    (status, int(expires_timestamp), guild_id, user_id)
+                )
+            elif status is not None:
+                await db.execute(
+                    "UPDATE active_verifications SET status=? WHERE guild_id=? AND user_id=?",
+                    (status, guild_id, user_id)
+                )
+            elif expires_timestamp is not None:
+                await db.execute(
+                    "UPDATE active_verifications SET expires_timestamp=? WHERE guild_id=? AND user_id=?",
+                    (int(expires_timestamp), guild_id, user_id)
+                )
+            await db.commit()
+    except Exception as e:
+        print(f"Active verification status update failed: {e}")
+
+
+async def _get_active_verification_row(guild_id, user_id):
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute(
+                "SELECT ticket_channel_id, expires_timestamp, status FROM active_verifications WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id)
+            ) as cursor:
+                return await cursor.fetchone()
+    except Exception as e:
+        print(f"Active verification row lookup failed: {e}")
+        return None
+
+
+async def pause_ticket_timer(guild, channel, actor):
+    data = ticket_tracking.get(channel.id)
+    if not data:
+        return False, "No timer found for this ticket."
+
+    if data.get("paused"):
+        remaining = paused_timers.get(channel.id, data.get("remaining_when_paused", 0))
+        return False, f"Timer is already paused ({format_duration(remaining)} left)."
+
+    expires_ts = data.get("expires_timestamp")
+    if expires_ts is None:
+        return False, "No active timer to pause."
+
+    remaining = max(0, int(expires_ts - time.time()))
+    paused_timers[channel.id] = remaining
+
+    data["paused"] = True
+    data["remaining_when_paused"] = remaining
+    data["status"] = "paused"
+    set_ticket_status(channel.id, "paused")
+
+    user_id = data.get("user_id")
+    if user_id:
+        await _set_active_verification_status(guild.id, user_id, status="paused")
+
+    await log_action(
+        guild,
+        "⏸️ Timer Paused",
+        f"{actor.mention} paused the timer in {channel.mention}. Auto-timeout is disabled until resumed.",
+        color=0xFEE75C,
+        fields=[
+            ("Staff", actor.mention, True),
+            ("Channel", channel.mention, True),
+            ("Remaining", format_duration(remaining), True)
+        ]
+    )
+    return True, f"⏸️ Timer paused. User will **not** be kicked while paused. ({format_duration(remaining)} left)"
+
+
+async def resume_ticket_timer(guild, channel, actor):
+    data = ticket_tracking.get(channel.id)
+    if not data:
+        return False, "No timer found for this ticket."
+
+    if not data.get("paused"):
+        return False, "Timer is not paused."
+
+    remaining = paused_timers.get(channel.id, data.get("remaining_when_paused"))
+    if remaining is None:
+        remaining = max(1, int((data.get("expires_timestamp") or time.time()) - time.time()))
+
+    new_expires = int(time.time()) + int(remaining)
+
+    data["expires_timestamp"] = new_expires
+    data["paused"] = False
+    data["remaining_when_paused"] = None
+    data["status"] = "open"
+    set_ticket_status(channel.id, "open")
+
+    if channel.id in paused_timers:
+        del paused_timers[channel.id]
+
+    user_id = data.get("user_id")
+    if user_id:
+        await _set_active_verification_status(guild.id, user_id, status="Waiting for verification", expires_timestamp=new_expires)
+
+    await log_action(
+        guild,
+        "▶️ Timer Resumed",
+        f"{actor.mention} resumed the timer in {channel.mention}.",
+        color=0x57F287,
+        fields=[
+            ("Staff", actor.mention, True),
+            ("Channel", channel.mention, True),
+            ("Remaining", format_duration(remaining), True)
+        ]
+    )
+    return True, f"▶️ Timer resumed ({format_duration(remaining)} left)."
+
+
+async def auto_kick_if_unverified(member_id, guild_id, delay=600):
+    # Wait a tiny bit first so the ticket row/tracking can be created.
+    await asyncio.sleep(5)
+
+    while True:
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            return
+
+        member = guild.get_member(member_id)
+        if not member:
+            return
+
+        guild_cfg = get_guild_config(guild.id)
+        stats = get_daily_stats(guild.id)
+
+        unverified_role = guild.get_role(guild_cfg["unverified_role"]) if guild_cfg.get("unverified_role") else None
+        if not unverified_role or unverified_role not in member.roles:
+            return
+
+        row = await _get_active_verification_row(guild_id, member_id)
+        ticket_channel_id = row[0] if row else None
+        db_expires_ts = row[1] if row else None
+        db_status = (row[2] or "").lower() if row else ""
+
+        data = ticket_tracking.get(ticket_channel_id, {}) if ticket_channel_id else {}
+
+        # HARD STOP: paused in memory OR paused in DB means no kicking.
+        if data.get("paused") or db_status == "paused":
+            await asyncio.sleep(5)
+            continue
+
+        expires_ts = data.get("expires_timestamp") or db_expires_ts
+        if not expires_ts:
+            await asyncio.sleep(5)
+            continue
+
+        if time.time() < int(expires_ts):
+            await asyncio.sleep(min(5, max(1, int(expires_ts - time.time()))))
+            continue
+
+        # One last check right before kicking, in case staff paused at the same second.
+        row = await _get_active_verification_row(guild_id, member_id)
+        db_status = (row[2] or "").lower() if row else ""
+        data = ticket_tracking.get(ticket_channel_id, {}) if ticket_channel_id else {}
+        if data.get("paused") or db_status == "paused":
+            await asyncio.sleep(5)
+            continue
+
+        try:
+            await member.send("⏰ You did not complete verification in time and were removed from the server.")
+        except Exception:
+            pass
+
+        try:
+            await member.kick(reason="Verification timeout")
+        except Exception as e:
+            print(f"Timeout kick failed: {e}")
+            return
+
+        stats["autokicked"] += 1
+
+        await log_action(
+            guild,
+            "⏰ Auto-Kicked (Timeout)",
+            f"{member.mention} was auto-kicked for not completing verification in time.",
+            color=0xED4245,
+            fields=[
+                ("User", member.mention, True),
+                ("User ID", str(member.id), True),
+                ("Reason", "Verification timeout", True)
+            ]
+        )
+
+        await remove_from_verification(member_id, guild_id)
+        return
+
 bot.run(os.getenv("TOKEN"))
