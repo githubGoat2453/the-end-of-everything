@@ -7561,53 +7561,541 @@ async def final_evolution_staffpanel_command(ctx):
     await _final_evolution_staffpanel(ctx)
 
 # =========================
-# ANTI RATE-LIMIT STARTUP RUNNER
+# FINAL ALL-FEATURES ADD-ON
+# INTERNAL AUDIT + MODMAIL + ROUTING + TRANSCRIPTS + CLEAN STARTUP
 # =========================
-# This does NOT bypass Discord's rate limit.
-# It prevents Railway from instantly crash-looping and making the rate limit worse.
+import io
+import random
 
+STAFF_ROLE_IDS = [1489769442538688554, 1492942635386536047]
+MODMAIL_CATEGORY_NAME = "MODMAIL"
+
+# Internal-only audit cache. This prevents verification/audit spam in public log channels.
+internal_audit_logs = []
+transcript_store = {}
+modmail_threads = globals().get("modmail_threads", globals().get("modmail_active", {}))
+modmail_claims = globals().get("modmail_claims", {})
+
+
+def _safe_member_name(obj):
+    try:
+        return f"{obj} ({obj.id})"
+    except Exception:
+        return str(obj)
+
+
+def _has_staff_role(member):
+    if not member or not getattr(member, "guild", None):
+        return False
+    if member.guild_permissions.administrator:
+        return True
+    return any(role.id in STAFF_ROLE_IDS for role in getattr(member, "roles", []))
+
+
+# Override existing staff check to include your two staff roles + admins.
+def is_staff_member(member):
+    return _has_staff_role(member)
+
+
+def _dashboard_is_staff(member):
+    return _has_staff_role(member)
+
+
+async def _internal_audit(guild, title, description, *, color=0x5865F2, fields=None, actor=None, target=None):
+    entry = {
+        "guild_id": guild.id if guild else None,
+        "title": title,
+        "description": description,
+        "created_at": int(time.time()),
+        "actor_id": getattr(actor, "id", None),
+        "target": str(target) if target is not None else None,
+        "fields": fields or []
+    }
+    internal_audit_logs.append(entry)
+    if len(internal_audit_logs) > 1000:
+        del internal_audit_logs[:len(internal_audit_logs) - 1000]
+
+    # Persist to DB only. No channel sends.
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "INSERT INTO log_history (guild_id, title, description, created_at) VALUES (?, ?, ?, ?)",
+                (guild.id, title, description, entry["created_at"])
+            )
+            await db.commit()
+    except Exception as e:
+        print(f"Internal audit persist failed: {e}")
+
+
+# Override log_action so audit logs stay inside the bot/DB and do NOT flood channels.
+async def log_action(guild, title, description, color=0x2b2d31, *, fields=None):
+    await _internal_audit(guild, title, description, color=color, fields=fields)
+
+
+async def save_ticket_transcript(channel, guild, reason="Ticket Closed"):
+    if not channel:
+        return
+
+    transcript_lines = []
+    transcript_lines.append(f"Ticket Transcript - {channel.name}")
+    transcript_lines.append(f"Reason: {reason}")
+    transcript_lines.append(f"Created: {channel.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    transcript_lines.append("=" * 60)
+
+    try:
+        async for message in channel.history(limit=None, oldest_first=True):
+            timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            author = f"{message.author} ({message.author.id})"
+            content = message.content if message.content else "[No text content]"
+            transcript_lines.append(f"[{timestamp}] {author}: {content}")
+            if message.attachments:
+                transcript_lines.append("Attachments: " + ", ".join(a.url for a in message.attachments))
+            transcript_lines.append("-" * 40)
+    except Exception as e:
+        transcript_lines.append(f"[Error fetching messages: {e}]")
+
+    text = "\n".join(transcript_lines)
+    transcript_store[channel.id] = {
+        "guild_id": guild.id,
+        "channel_name": channel.name,
+        "reason": reason,
+        "created_at": int(time.time()),
+        "text": text
+    }
+
+    await _internal_audit(
+        guild,
+        "📜 Transcript Saved Internally",
+        f"Transcript saved internally for **{channel.name}**. Reason: {reason}",
+        target=channel.name
+    )
+
+
+async def _send_text_file(destination, filename, text, message="📄 File ready:"):
+    fp = io.BytesIO(text.encode("utf-8", errors="ignore"))
+    file = discord.File(fp, filename=filename)
+    await destination.send(message, file=file)
+
+
+async def _build_channel_transcript(channel, limit=None):
+    lines = [f"Transcript for #{channel.name}", "=" * 50]
+    async for msg in channel.history(limit=limit, oldest_first=True):
+        ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f"[{ts}] {msg.author}: {msg.content or '[No text]'}")
+        if msg.attachments:
+            for att in msg.attachments:
+                lines.append(f"Attachment: {att.url}")
+        lines.append("-" * 30)
+    return "\n".join(lines)
+
+
+@bot.command(name="transcript")
+async def transcript_command(ctx, limit: int = 300):
+    if not is_staff_member(ctx.author):
+        return await ctx.send("Staff only.")
+    text = await _build_channel_transcript(ctx.channel, limit=limit)
+    await _send_text_file(ctx, f"{ctx.channel.name}_transcript.txt", text, "📄 Transcript download:")
+    await _internal_audit(ctx.guild, "📄 Transcript Downloaded", f"{ctx.author.mention} downloaded transcript for {ctx.channel.mention}.", actor=ctx.author)
+
+
+@bot.command(name="auditlogs", aliases=["internallogs"])
+async def auditlogs_command(ctx, limit: int = 25):
+    if not is_staff_member(ctx.author):
+        return await ctx.send("Staff only.")
+    rows = [x for x in internal_audit_logs if x.get("guild_id") == ctx.guild.id][-max(1, min(limit, 50)):]
+    if not rows:
+        rows = []
+        try:
+            fetched = await fetch_recent_logs(ctx.guild.id, None, limit=max(1, min(limit, 50)))
+            for title, desc, created_at in fetched:
+                rows.append({"title": title, "description": desc, "created_at": created_at})
+        except Exception:
+            pass
+
+    embed = discord.Embed(title="🗂️ Internal Audit Logs", color=0x5865F2)
+    if not rows:
+        embed.description = "No internal logs found."
+    else:
+        for entry in reversed(rows[-10:]):
+            embed.add_field(
+                name=f"{entry['title']} • <t:{entry['created_at']}:R>",
+                value=str(entry["description"])[:900],
+                inline=False
+            )
+    await ctx.send(embed=embed)
+
+
+def _least_busy_staff(guild):
+    candidates = []
+    for member in guild.members:
+        if member.bot or not is_staff_member(member):
+            continue
+        load = 0
+        for data in ticket_tracking.values():
+            if isinstance(data, dict) and data.get("claimed_by") == member.id:
+                load += 1
+        score_data = staff_cache.get((guild.id, member.id), {})
+        closed = score_data.get("tickets_closed", 0)
+        candidates.append((load, -closed, member))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return candidates[0][2]
+
+
+@bot.command(name="routeticket")
+async def route_ticket_command(ctx):
+    if not is_staff_member(ctx.author):
+        return await ctx.send("Staff only.")
+    staff = _least_busy_staff(ctx.guild)
+    if not staff:
+        return await ctx.send("No staff found to route this ticket.")
+    if ctx.channel.id not in ticket_tracking:
+        ticket_tracking[ctx.channel.id] = {}
+    ticket_tracking[ctx.channel.id]["claimed_by"] = staff.id
+    ticket_tracking[ctx.channel.id]["status"] = "routed"
+    add_staff_stat(ctx.guild.id, staff.id, "tickets_claimed", 1)
+    await save_staff_stats(ctx.guild.id, staff.id)
+    await _internal_audit(ctx.guild, "🎫 Ticket Routed", f"{ctx.channel.mention} routed to {staff.mention} by {ctx.author.mention}.", actor=ctx.author, target=staff)
+    await ctx.send(f"🎫 Routed this ticket to {staff.mention}.")
+
+
+def _no_api_auto_judge_score(messages):
+    text = " ".join(messages).lower()
+    score = 50
+    reasons = []
+
+    if len(text) < 40:
+        score -= 25
+        reasons.append("Very low detail")
+    if any(x in text for x in ["idk", "dont know", "don't know", "lol", "lmao", "anything"]):
+        score -= 20
+        reasons.append("Weak / dismissive answers")
+    if any(x in text for x in ["bot", "spam", "raid", "alt"]):
+        score -= 15
+        reasons.append("Suspicious keywords")
+    if len(text) > 180:
+        score += 15
+        reasons.append("Detailed answers")
+    if any(x in text for x in ["friend", "invited", "know", "proof", "because"]):
+        score += 10
+        reasons.append("Context provided")
+
+    score = max(0, min(100, score))
+    if score >= 75:
+        verdict = "Likely OK"
+    elif score >= 45:
+        verdict = "Manual Review"
+    else:
+        verdict = "High Risk"
+    return score, verdict, reasons or ["No strong signals"]
+
+
+@bot.command(name="fakejudge", aliases=["nojude", "noapijudge", "rulejudge"])
+async def fake_judge_command(ctx, limit: int = 50):
+    if not is_staff_member(ctx.author):
+        return await ctx.send("Staff only.")
+    msgs = []
+    async for msg in ctx.channel.history(limit=max(5, min(limit, 100)), oldest_first=True):
+        if not msg.author.bot:
+            msgs.append(msg.content)
+    score, verdict, reasons = _no_api_auto_judge_score(msgs)
+    embed = discord.Embed(title="🧠 No-API Auto Judge", color=0x57F287 if score >= 75 else 0xFEE75C if score >= 45 else 0xED4245)
+    embed.add_field(name="Score", value=f"{score}/100", inline=True)
+    embed.add_field(name="Verdict", value=verdict, inline=True)
+    embed.add_field(name="Reasons", value="\n".join(f"• {r}" for r in reasons), inline=False)
+    await _internal_audit(ctx.guild, "🧠 No-API Judge Used", f"{ctx.author.mention} ran no-API judge in {ctx.channel.mention}. Score: {score}/100", actor=ctx.author)
+    await ctx.send(embed=embed)
+
+
+async def _get_modmail_category(guild):
+    category = discord.utils.get(guild.categories, name=MODMAIL_CATEGORY_NAME)
+    if not category:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True)
+        }
+        for role_id in STAFF_ROLE_IDS:
+            role = guild.get_role(role_id)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+        if guild.owner:
+            overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+        category = await guild.create_category(MODMAIL_CATEGORY_NAME, overwrites=overwrites)
+        await _internal_audit(guild, "📩 Modmail Category Created", "MODMAIL category created with staff-only permissions.")
+    return category
+
+
+async def _create_or_get_modmail_channel(guild, user, opener=None):
+    existing_id = modmail_threads.get(user.id)
+    if existing_id:
+        existing = guild.get_channel(existing_id)
+        if existing:
+            return existing
+
+    category = await _get_modmail_category(guild)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True),
+    }
+    for role_id in STAFF_ROLE_IDS:
+        role = guild.get_role(role_id)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+    if guild.owner:
+        overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "-", user.name.lower())[:80]
+    channel = await guild.create_text_channel(
+        name=f"modmail-{safe_name}",
+        category=category,
+        overwrites=overwrites,
+        topic=f"modmail_for:{user.id}"
+    )
+    modmail_threads[user.id] = channel.id
+
+    embed = discord.Embed(title="📩 Modmail Opened", color=0x5865F2)
+    embed.add_field(name="User", value=f"{user.mention if isinstance(user, discord.Member) else user} (`{user.id}`)", inline=False)
+    embed.add_field(name="Opened By", value=opener.mention if opener else "User DM", inline=True)
+    embed.add_field(name="Status", value="Open", inline=True)
+    embed.set_footer(text="Reply in this channel to DM the user.")
+    await channel.send(embed=embed, view=ModmailControlView(user.id))
+    await _internal_audit(guild, "📩 Modmail Opened", f"Modmail opened for <@{user.id}>.", actor=opener, target=user.id)
+    return channel
+
+
+class ModmailControlView(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction):
+        if not is_staff_member(interaction.user):
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="📌 Claim", style=discord.ButtonStyle.primary, row=0)
+    async def claim(self, interaction, button):
+        modmail_claims[interaction.channel.id] = interaction.user.id
+        await _internal_audit(interaction.guild, "📌 Modmail Claimed", f"{interaction.user.mention} claimed modmail for <@{self.user_id}>.", actor=interaction.user, target=self.user_id)
+        await interaction.response.send_message(f"📌 Claimed by {interaction.user.mention}")
+
+    @discord.ui.button(label="🔓 Unclaim", style=discord.ButtonStyle.secondary, row=0)
+    async def unclaim(self, interaction, button):
+        modmail_claims.pop(interaction.channel.id, None)
+        await _internal_audit(interaction.guild, "🔓 Modmail Unclaimed", f"{interaction.user.mention} unclaimed modmail for <@{self.user_id}>.", actor=interaction.user, target=self.user_id)
+        await interaction.response.send_message("🔓 Unclaimed.")
+
+    @discord.ui.button(label="📄 Transcript", style=discord.ButtonStyle.secondary, row=0)
+    async def transcript(self, interaction, button):
+        text = await _build_channel_transcript(interaction.channel, limit=None)
+        await interaction.response.defer(ephemeral=True)
+        await _send_text_file(interaction.followup, f"{interaction.channel.name}_transcript.txt", text, "📄 Modmail transcript:")
+        await _internal_audit(interaction.guild, "📄 Modmail Transcript Downloaded", f"{interaction.user.mention} downloaded modmail transcript.", actor=interaction.user, target=self.user_id)
+
+    @discord.ui.button(label="❌ Close", style=discord.ButtonStyle.danger, row=0)
+    async def close(self, interaction, button):
+        user = await bot.fetch_user(self.user_id)
+        text = await _build_channel_transcript(interaction.channel, limit=None)
+        transcript_store[interaction.channel.id] = {
+            "guild_id": interaction.guild.id,
+            "channel_name": interaction.channel.name,
+            "reason": "Modmail Closed",
+            "created_at": int(time.time()),
+            "text": text
+        }
+        try:
+            await user.send("📪 Your modmail conversation has been closed.")
+        except Exception:
+            pass
+        modmail_threads.pop(self.user_id, None)
+        modmail_claims.pop(interaction.channel.id, None)
+        await _internal_audit(interaction.guild, "❌ Modmail Closed", f"{interaction.user.mention} closed modmail for <@{self.user_id}>.", actor=interaction.user, target=self.user_id, color=0xED4245)
+        await interaction.response.send_message("Closing modmail...", ephemeral=True)
+        await asyncio.sleep(1)
+        await interaction.channel.delete()
+
+
+class PublicModmailButtonView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📩 Open Modmail", style=discord.ButtonStyle.primary)
+    async def open_modmail(self, interaction, button):
+        channel = await _create_or_get_modmail_channel(interaction.guild, interaction.user, opener=interaction.user)
+        try:
+            await interaction.user.send("📩 Your modmail is open. Reply here to talk to staff.")
+        except Exception:
+            pass
+        await interaction.response.send_message(f"✅ Modmail opened: {channel.mention}", ephemeral=True)
+
+
+@bot.command(name="modmailpanel")
+async def modmailpanel_command(ctx):
+    embed = discord.Embed(
+        title="📩 Contact Staff",
+        description="Click the button below or DM the bot to open a private staff modmail ticket.",
+        color=0x5865F2
+    )
+    await ctx.send(embed=embed, view=PublicModmailButtonView())
+
+
+@bot.command(name="closemodmail", aliases=["enddm"])
+async def close_modmail_command(ctx):
+    if not is_staff_member(ctx.author):
+        return await ctx.send("Staff only.")
+    for user_id, channel_id in list(modmail_threads.items()):
+        if channel_id == ctx.channel.id:
+            text = await _build_channel_transcript(ctx.channel, limit=None)
+            transcript_store[ctx.channel.id] = {
+                "guild_id": ctx.guild.id,
+                "channel_name": ctx.channel.name,
+                "reason": "Modmail Closed",
+                "created_at": int(time.time()),
+                "text": text
+            }
+            user = await bot.fetch_user(user_id)
+            try:
+                await user.send("📪 Your modmail conversation has been closed.")
+            except Exception:
+                pass
+            modmail_threads.pop(user_id, None)
+            await _internal_audit(ctx.guild, "❌ Modmail Closed", f"{ctx.author.mention} closed modmail for <@{user_id}>.", actor=ctx.author, target=user_id)
+            await ctx.channel.delete()
+            return
+    await ctx.send("This is not a modmail channel.")
+
+
+# Replace on_message with one clean handler so modmail and commands both work without duplicates.
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    # User DM -> create/get staff-only MODMAIL ticket and forward message.
+    if isinstance(message.channel, discord.DMChannel):
+        if not bot.guilds:
+            return
+        guild = bot.guilds[0]
+        user = message.author
+        channel = await _create_or_get_modmail_channel(guild, user)
+        embed = discord.Embed(description=message.content or "[No text content]", color=0x2B2D31)
+        embed.set_author(name=str(user), icon_url=user.display_avatar.url)
+        embed.timestamp = discord.utils.utcnow()
+        await channel.send(content="🔔 New DM from user", embed=embed)
+        for att in message.attachments:
+            await channel.send(f"📎 Attachment from {user}: {att.url}")
+        await _internal_audit(guild, "📩 User DM Received", f"DM from <@{user.id}> forwarded to {channel.mention}.", target=user.id)
+        return
+
+    # Staff modmail ticket -> user DM.
+    for user_id, channel_id in list(modmail_threads.items()):
+        if message.channel.id == channel_id:
+            if not is_staff_member(message.author):
+                return
+            user = await bot.fetch_user(user_id)
+            try:
+                embed = discord.Embed(description=message.content or "[No text content]", color=0x5865F2)
+                embed.set_author(name=f"Staff • {message.author.display_name}", icon_url=message.author.display_avatar.url)
+                embed.timestamp = discord.utils.utcnow()
+                await user.send(embed=embed)
+                for att in message.attachments:
+                    await user.send(att.url)
+                await _internal_audit(message.guild, "💬 Staff Modmail Reply", f"{message.author.mention} replied to <@{user_id}>.", actor=message.author, target=user_id)
+            except Exception as e:
+                await message.channel.send(f"❌ Could not DM user: `{e}`")
+                await _internal_audit(message.guild, "⚠️ Modmail DM Failed", f"Could not DM <@{user_id}>: {e}", actor=message.author, target=user_id, color=0xED4245)
+            return
+
+    await bot.process_commands(message)
+
+
+# Upgrade Final Evolution modmail panel if it exists.
+def _fe_modmail_embed(guild):
+    embed = discord.Embed(title="📩 Modmail Dashboard", color=0x9B59B6)
+    if not modmail_threads:
+        embed.description = "No active modmail sessions."
+    else:
+        lines = []
+        for user_id, channel_id in list(modmail_threads.items())[:15]:
+            ch = guild.get_channel(channel_id)
+            claimed = modmail_claims.get(channel_id)
+            lines.append(f"• <@{user_id}> → {ch.mention if ch else channel_id} • Claimed: {f'<@{claimed}>' if claimed else 'None'}")
+        embed.description = "\n".join(lines)
+    embed.add_field(name="Open from user side", value="Users can DM the bot or click `.modmailpanel`.", inline=False)
+    embed.set_footer(text="Final Build • Modmail inside dashboard UI")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+
+class FinalEvolutionModmailView(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=None)
+        self.guild = guild
+
+    async def interaction_check(self, interaction):
+        if not is_staff_member(interaction.user):
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        await interaction.response.edit_message(embed=_fe_modmail_embed(self.guild), view=self)
+
+    @discord.ui.button(label="🧹 Clean Closed", style=discord.ButtonStyle.secondary, row=0)
+    async def clean(self, interaction, button):
+        removed = 0
+        for user_id, ch_id in list(modmail_threads.items()):
+            if not self.guild.get_channel(ch_id):
+                modmail_threads.pop(user_id, None)
+                removed += 1
+        await _internal_audit(interaction.guild, "🧹 Modmail Cleaned", f"{interaction.user.mention} cleaned {removed} closed modmail session(s).", actor=interaction.user)
+        await interaction.response.edit_message(embed=_fe_modmail_embed(self.guild), view=self)
+
+    @discord.ui.button(label="📄 Export Active List", style=discord.ButtonStyle.primary, row=0)
+    async def export(self, interaction, button):
+        text = "Active Modmail Sessions\n" + "-" * 40 + "\n"
+        for user_id, ch_id in modmail_threads.items():
+            text += f"User {user_id} -> Channel {ch_id}\n"
+        await interaction.response.defer(ephemeral=True)
+        await _send_text_file(interaction.followup, "active_modmail.txt", text, "📄 Active modmail list:")
+
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.primary, row=4)
+    async def back(self, interaction, button):
+        try:
+            hub = FinalEvolutionStaffHub(self.guild)
+            await interaction.response.edit_message(embed=_fe_main_embed(self.guild), view=hub)
+        except Exception:
+            await interaction.response.send_message("Back panel unavailable.", ephemeral=True)
+
+
+# Clean safe startup: no infinite bot.start loop, so commands do not double-fire.
 async def safe_start_bot():
     token = os.getenv("TOKEN")
     if not token:
         print("❌ TOKEN env variable is missing.")
         return
 
-    startup_delay = int(os.getenv("STARTUP_DELAY_SECONDS", "20"))
+    startup_delay = int(os.getenv("STARTUP_DELAY_SECONDS", "15"))
     print(f"⏳ Startup guard active. Waiting {startup_delay}s before Discord login...")
     await asyncio.sleep(startup_delay)
 
-    while True:
-        try:
-            print("🔐 Attempting Discord login...")
-            await bot.start(token, reconnect=True)
-
-        except discord.HTTPException as e:
-            text = str(e)
-            if getattr(e, "status", None) == 429 or "Too Many Requests" in text or "1015" in text:
-                cooldown = int(os.getenv("DISCORD_429_COOLDOWN_SECONDS", "1800"))
-                print("🚫 Discord login rate-limited / Cloudflare 1015.")
-                print(f"🕒 Sleeping {cooldown}s so the host does NOT restart-loop.")
-                await asyncio.sleep(cooldown)
-                continue
-
-            print(f"❌ Discord HTTPException during startup: {e}")
-            raise
-
-        except discord.LoginFailure as e:
-            print("❌ Invalid Discord token. Fix TOKEN in Railway Variables.")
-            print(e)
+    try:
+        print("🔐 Starting bot safely...")
+        await bot.start(token, reconnect=True)
+    except discord.HTTPException as e:
+        text = str(e)
+        if getattr(e, "status", None) == 429 or "Too Many Requests" in text or "1015" in text:
+            print("🚫 Discord login rate-limited / Cloudflare 1015.")
+            print("🕒 Stop the host and wait 20–30 minutes before trying again.")
             return
-
-        except Exception as e:
-            print(f"❌ Startup error: {type(e).__name__}: {e}")
-            cooldown = int(os.getenv("STARTUP_ERROR_COOLDOWN_SECONDS", "120"))
-            print(f"🕒 Sleeping {cooldown}s before retry to avoid crash-loop.")
-            await asyncio.sleep(cooldown)
-            continue
-
-        finally:
-            if not bot.is_closed():
-                await bot.close()
+        raise
+    except discord.LoginFailure as e:
+        print("❌ Invalid Discord token. Fix TOKEN in Railway Variables.")
+        print(e)
+        return
 
 
 if __name__ == "__main__":
