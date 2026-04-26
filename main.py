@@ -6753,7 +6753,7 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-@bot.command()
+@bot.command(name="enddm_legacy_disabled")
 async def enddm(ctx):
     for user_id, channel_id in list(modmail_active.items()):
         if channel_id == ctx.channel.id:
@@ -7940,6 +7940,15 @@ async def modmailpanel_command(ctx):
     )
     await ctx.send(embed=embed, view=PublicModmailButtonView())
 
+
+try:
+    bot.remove_command("closemodmail")
+except Exception:
+    pass
+try:
+    bot.remove_command("enddm")
+except Exception:
+    pass
 
 @bot.command(name="closemodmail", aliases=["enddm"])
 async def close_modmail_command(ctx):
