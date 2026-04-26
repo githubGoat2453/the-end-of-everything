@@ -1217,7 +1217,7 @@ class TicketControls(discord.ui.View):
 
         await interaction.response.send_message("Requested proof from user.", ephemeral=True)
 
-    @discord.ui.button(label="Modmail 📩", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="Modmail 📩", style=discord.ButtonStyle.primary, row=3)
     async def open_modmail_ticket_button(self, interaction, button):
         if not self.is_staff(interaction):
             return await interaction.response.send_message("Staff only", ephemeral=True)
@@ -1230,7 +1230,11 @@ class TicketControls(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            channel = await _create_or_get_modmail_channel(interaction.guild, member, opener=interaction.user)
+            target_guild = _get_target_modmail_guild()
+            if not target_guild:
+                return await interaction.followup.send("⚠️ Staff server is not available right now.", ephemeral=True)
+            target_member = target_guild.get_member(member.id) or member
+            channel = await _create_or_get_modmail_channel(target_guild, target_member, opener=interaction.user)
             try:
                 await member.send(
                     "📩 **Modmail opened**\n"
@@ -6777,7 +6781,7 @@ async def on_message(message):
 
     if isinstance(message.channel, discord.DMChannel):
         user = message.author
-        guild = bot.guilds[0]
+        guild = _get_target_modmail_guild()
 
         if user.id in modmail_active:
             channel = guild.get_channel(modmail_active[user.id])
@@ -7616,6 +7620,16 @@ import random
 
 STAFF_ROLE_IDS = [1489769442538688554, 1492942635386536047]
 MODMAIL_CATEGORY_NAME = "MODMAIL"
+TARGET_MODMAIL_GUILD_ID = 1489476010725609532
+
+def _get_target_modmail_guild():
+    guild = bot.get_guild(TARGET_MODMAIL_GUILD_ID)
+    if guild:
+        return guild
+    for g in bot.guilds:
+        if g.id == TARGET_MODMAIL_GUILD_ID:
+            return g
+    return None
 
 # Internal-only audit cache. This prevents verification/audit spam in public log channels.
 internal_audit_logs = []
@@ -7981,12 +7995,15 @@ class PublicModmailButtonView(discord.ui.View):
 
     @discord.ui.button(label="📩 Open Modmail", style=discord.ButtonStyle.primary)
     async def open_modmail(self, interaction, button):
-        channel = await _create_or_get_modmail_channel(interaction.guild, interaction.user, opener=interaction.user)
+        guild = _get_target_modmail_guild()
+        if not guild:
+            return await interaction.response.send_message("⚠️ Staff server is not available right now.", ephemeral=True)
+        channel = await _create_or_get_modmail_channel(guild, interaction.user, opener=interaction.user)
         try:
             await interaction.user.send("📩 Your modmail is open. Reply here to talk to staff.")
         except Exception:
             pass
-        await interaction.response.send_message(f"✅ Modmail opened: {channel.mention}", ephemeral=True)
+        await interaction.response.send_message(f"✅ Modmail opened in the staff server.", ephemeral=True)
 
 
 @bot.command(name="modmailpanel")
@@ -8044,7 +8061,7 @@ async def on_message(message):
     if isinstance(message.channel, discord.DMChannel):
         if not bot.guilds:
             return
-        guild = bot.guilds[0]
+        guild = _get_target_modmail_guild()
         user = message.author
         try:
             channel = await _create_or_get_modmail_channel(guild, user)
