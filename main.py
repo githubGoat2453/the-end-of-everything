@@ -7560,4 +7560,55 @@ except Exception:
 async def final_evolution_staffpanel_command(ctx):
     await _final_evolution_staffpanel(ctx)
 
-bot.run(os.getenv("TOKEN"))
+# =========================
+# ANTI RATE-LIMIT STARTUP RUNNER
+# =========================
+# This does NOT bypass Discord's rate limit.
+# It prevents Railway from instantly crash-looping and making the rate limit worse.
+
+async def safe_start_bot():
+    token = os.getenv("TOKEN")
+    if not token:
+        print("❌ TOKEN env variable is missing.")
+        return
+
+    startup_delay = int(os.getenv("STARTUP_DELAY_SECONDS", "20"))
+    print(f"⏳ Startup guard active. Waiting {startup_delay}s before Discord login...")
+    await asyncio.sleep(startup_delay)
+
+    while True:
+        try:
+            print("🔐 Attempting Discord login...")
+            await bot.start(token, reconnect=True)
+
+        except discord.HTTPException as e:
+            text = str(e)
+            if getattr(e, "status", None) == 429 or "Too Many Requests" in text or "1015" in text:
+                cooldown = int(os.getenv("DISCORD_429_COOLDOWN_SECONDS", "1800"))
+                print("🚫 Discord login rate-limited / Cloudflare 1015.")
+                print(f"🕒 Sleeping {cooldown}s so the host does NOT restart-loop.")
+                await asyncio.sleep(cooldown)
+                continue
+
+            print(f"❌ Discord HTTPException during startup: {e}")
+            raise
+
+        except discord.LoginFailure as e:
+            print("❌ Invalid Discord token. Fix TOKEN in Railway Variables.")
+            print(e)
+            return
+
+        except Exception as e:
+            print(f"❌ Startup error: {type(e).__name__}: {e}")
+            cooldown = int(os.getenv("STARTUP_ERROR_COOLDOWN_SECONDS", "120"))
+            print(f"🕒 Sleeping {cooldown}s before retry to avoid crash-loop.")
+            await asyncio.sleep(cooldown)
+            continue
+
+        finally:
+            if not bot.is_closed():
+                await bot.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(safe_start_bot())
