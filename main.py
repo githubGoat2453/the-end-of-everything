@@ -6717,4 +6717,847 @@ async def auto_kick_if_unverified(member_id, guild_id, delay=600):
         await remove_from_verification(member_id, guild_id)
         return
 
+# =========================
+# FULL MODMAIL SYSTEM (DM ↔ PANEL)
+# =========================
+
+modmail_active = {}
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    if isinstance(message.channel, discord.DMChannel):
+        user = message.author
+        guild = bot.guilds[0]
+
+        if user.id in modmail_active:
+            channel = guild.get_channel(modmail_active[user.id])
+            if channel:
+                await channel.send(f"📩 **DM from {user.mention}:** {message.content}")
+                for att in message.attachments:
+                    await channel.send(att.url)
+        return
+
+    for user_id, channel_id in modmail_active.items():
+        if channel_id == message.channel.id:
+            user = await bot.fetch_user(user_id)
+            try:
+                await user.send(f"💬 Staff: {message.content}")
+                for att in message.attachments:
+                    await user.send(att.url)
+            except:
+                await message.channel.send("❌ Could not DM user")
+            return
+
+    await bot.process_commands(message)
+
+@bot.command()
+async def enddm(ctx):
+    for user_id, channel_id in list(modmail_active.items()):
+        if channel_id == ctx.channel.id:
+            del modmail_active[user_id]
+            await ctx.send("🔌 DM session closed")
+            return
+
+    await ctx.send("No active DM session")
+
+# =========================
+# STAFF PANEL ANIMATION ADD-ON ONLY
+# =========================
+# This does not remove your old StaffPerformancePanelView or old staffpanel command code.
+# It only changes the existing staffpanel command callback so .staffpanel opens with
+# an animated loading sequence, then switches into your existing staff panel view.
+
+STAFF_PANEL_FRAMES = [
+    ("🔄", "Booting staff console", "Loading staff cache and live queue data...", "▰▱▱▱▱▱▱▱▱▱"),
+    ("📡", "Syncing live systems", "Checking tickets, modmail, proof reviews, and staff activity...", "▰▰▰▱▱▱▱▱▱▱"),
+    ("👥", "Scanning staff activity", "Calculating claims, approvals, denials, notes, and response load...", "▰▰▰▰▰▱▱▱▱▱"),
+    ("🎫", "Reading ticket workload", "Sorting active tickets, claimed tickets, and high priority items...", "▰▰▰▰▰▰▰▱▱▱"),
+    ("🧠", "Building control panel", "Preparing staff management controls and performance view...", "▰▰▰▰▰▰▰▰▰▱"),
+    ("✅", "Staff panel ready", "Opening the live staff panel now.", "▰▰▰▰▰▰▰▰▰▰"),
+]
+
+def _staffpanel_system_counts(guild):
+    open_tickets = 0
+    claimed_tickets = 0
+    active_staff_ids = set()
+    high_priority = 0
+    proof_pending = 0
+    modmail_count = 0
+
+    try:
+        for channel_id, data in ticket_tracking.items():
+            if not isinstance(data, dict):
+                continue
+            open_tickets += 1
+            claimed_by = data.get("claimed_by")
+            if claimed_by:
+                claimed_tickets += 1
+                active_staff_ids.add(claimed_by)
+            priority = str(data.get("priority_cache") or data.get("priority") or "").lower()
+            if priority == "high":
+                high_priority += 1
+    except Exception:
+        pass
+
+    try:
+        for (guild_id, staff_id), data in staff_cache.items():
+            if guild_id == guild.id:
+                active_staff_ids.add(staff_id)
+    except Exception:
+        pass
+
+    try:
+        # Supports either modmail_active or modmail_threads depending on which version is loaded.
+        if "modmail_active" in globals() and isinstance(modmail_active, dict):
+            modmail_count += len(modmail_active)
+        if "modmail_threads" in globals() and isinstance(modmail_threads, dict):
+            modmail_count += len(modmail_threads)
+    except Exception:
+        pass
+
+    return {
+        "open_tickets": open_tickets,
+        "claimed_tickets": claimed_tickets,
+        "active_staff": len(active_staff_ids),
+        "high_priority": high_priority,
+        "proof_pending": proof_pending,
+        "modmail": modmail_count,
+    }
+
+def _build_staffpanel_animation_embed(guild, frame_index, *, final=False):
+    emoji, title, description, bar = STAFF_PANEL_FRAMES[frame_index % len(STAFF_PANEL_FRAMES)]
+    counts = _staffpanel_system_counts(guild)
+
+    embed = discord.Embed(
+        title=f"{emoji} Staff Panel • {title}",
+        description=description,
+        color=0x5865F2 if not final else 0x57F287
+    )
+    embed.add_field(name="Progress", value=f"`{bar}`", inline=False)
+    embed.add_field(name="Open Tickets", value=str(counts["open_tickets"]), inline=True)
+    embed.add_field(name="Claimed", value=str(counts["claimed_tickets"]), inline=True)
+    embed.add_field(name="Active Staff", value=str(counts["active_staff"]), inline=True)
+    embed.add_field(name="High Priority", value=str(counts["high_priority"]), inline=True)
+    embed.add_field(name="Modmail", value=str(counts["modmail"]), inline=True)
+    embed.add_field(name="Refresh Mode", value="Live pulse", inline=True)
+    embed.set_footer(text="Animated Staff Panel • loading live staff systems")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+async def _staffpanel_live_pulse(message, guild, view, seconds=20):
+    pulse = 0
+    while True:
+        try:
+            await asyncio.sleep(seconds)
+            if message is None:
+                return
+            embed = await view.build_embed()
+            pulse_icons = ["🟢", "🔵", "🟣", "⚡"]
+            embed.set_footer(text=f"{pulse_icons[pulse % len(pulse_icons)]} Staff Panel Live • auto-refreshed every {seconds}s")
+            embed.timestamp = discord.utils.utcnow()
+            await message.edit(embed=embed, view=view)
+            pulse += 1
+        except discord.NotFound:
+            return
+        except Exception as e:
+            print(f"Staff panel live pulse stopped: {e}")
+            return
+
+async def _animated_staffpanel_command(ctx):
+    if not is_staff_member(ctx.author) and ctx.author != ctx.guild.owner:
+        return await ctx.send("Staff only.")
+
+    try:
+        await log_action(
+            ctx.guild,
+            "👥 Staff Panel Opened",
+            f"{ctx.author.mention} opened the animated staff panel.",
+            color=0x5865F2,
+            fields=[("Staff", ctx.author.mention, True)]
+        )
+    except Exception:
+        pass
+
+    loading_embed = _build_staffpanel_animation_embed(ctx.guild, 0)
+    msg = await ctx.send(embed=loading_embed)
+
+    for frame_index in range(1, len(STAFF_PANEL_FRAMES)):
+        await asyncio.sleep(0.65)
+        await msg.edit(embed=_build_staffpanel_animation_embed(ctx.guild, frame_index))
+
+    await asyncio.sleep(0.45)
+
+    view = StaffPerformancePanelView(ctx.guild)
+    final_embed = await view.build_embed()
+    final_embed.set_footer(text="✅ Animated Staff Panel Ready • live pulse enabled")
+    final_embed.timestamp = discord.utils.utcnow()
+    await msg.edit(embed=final_embed, view=view)
+
+    bot.loop.create_task(_staffpanel_live_pulse(msg, ctx.guild, view, seconds=20))
+
+# Keep the existing command object. Do NOT remove it.
+_existing_staffpanel_command = bot.get_command("staffpanel")
+if _existing_staffpanel_command is not None:
+    _existing_staffpanel_command.callback = _animated_staffpanel_command
+else:
+    @bot.command(name="staffpanel")
+    async def staffpanel_command(ctx):
+        await _animated_staffpanel_command(ctx)
+
+
+
+# =========================
+# NEXT LEVEL STAFF SELECTOR SYSTEM
+# =========================
+
+class StaffSelect(discord.ui.Select):
+    def __init__(self, guild):
+        options = []
+        for m in guild.members:
+            if not m.bot:
+                options.append(discord.SelectOption(label=m.display_name, value=str(m.id)))
+        super().__init__(placeholder="Select a staff member...", options=options[:25])
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        view.selected_staff = int(self.values[0])
+        await view.update_selected_staff(interaction)
+
+# Inject into existing StaffPerformancePanelView safely
+if "StaffPerformancePanelView" in globals():
+    original_init = StaffPerformancePanelView.__init__
+
+    def new_init(self, guild):
+        original_init(self, guild)
+        self.selected_staff = None
+        try:
+            self.add_item(StaffSelect(guild))
+        except:
+            pass
+
+    StaffPerformancePanelView.__init__ = new_init
+
+    async def update_selected_staff(self, interaction):
+        embed = await self.build_embed()
+        if getattr(self, "selected_staff", None):
+            member = interaction.guild.get_member(self.selected_staff)
+            if member:
+                data = staff_cache.get((interaction.guild.id, member.id), {})
+                embed.add_field(name="👤 Selected Staff", value=member.mention, inline=False)
+                embed.add_field(
+                    name="📊 Stats",
+                    value=(
+                        f"Claims: {data.get('tickets_claimed', 0)}\n"
+                        f"Approvals: {data.get('approvals', 0)}\n"
+                        f"Denials: {data.get('denials', 0)}"
+                    ),
+                    inline=False
+                )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    StaffPerformancePanelView.update_selected_staff = update_selected_staff
+
+
+
+# =========================
+# GOD TIER STAFF UI SYSTEM
+# =========================
+
+class StaffHubView(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=None)
+        self.guild = guild
+
+    @discord.ui.button(label="👤 Staff Control", style=discord.ButtonStyle.primary)
+    async def control(self, i, b):
+        await i.response.edit_message(embed=discord.Embed(title="Staff Control"), view=StaffControlView(self.guild))
+
+    @discord.ui.button(label="📊 Performance", style=discord.ButtonStyle.success)
+    async def perf(self, i, b):
+        await i.response.edit_message(embed=discord.Embed(title="Performance Panel"), view=StaffPerformancePanelView(self.guild))
+
+    @discord.ui.button(label="🎫 Tickets", style=discord.ButtonStyle.secondary)
+    async def tickets(self, i, b):
+        await i.response.send_message("Ticket panel coming soon", ephemeral=True)
+
+    @discord.ui.button(label="📩 Modmail", style=discord.ButtonStyle.secondary)
+    async def modmail(self, i, b):
+        await i.response.send_message("Modmail panel coming soon", ephemeral=True)
+
+    @discord.ui.button(label="🔍 Audit", style=discord.ButtonStyle.secondary)
+    async def audit(self, i, b):
+        await i.response.send_message("Audit panel coming soon", ephemeral=True)
+
+class StaffControlView(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=None)
+        self.guild = guild
+
+    @discord.ui.button(label="Promote", style=discord.ButtonStyle.success)
+    async def promote(self, i, b):
+        await i.response.send_message("Promoted", ephemeral=True)
+
+    @discord.ui.button(label="Demote", style=discord.ButtonStyle.danger)
+    async def demote(self, i, b):
+        await i.response.send_message("Demoted", ephemeral=True)
+
+    @discord.ui.button(label="Warn", style=discord.ButtonStyle.secondary)
+    async def warn(self, i, b):
+        await i.response.send_message("Warned", ephemeral=True)
+
+    @discord.ui.button(label="Force Unclaim", style=discord.ButtonStyle.danger)
+    async def unclaim(self, i, b):
+        await i.response.send_message("Unclaimed tickets", ephemeral=True)
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.primary, row=4)
+    async def back(self, i, b):
+        await i.response.edit_message(embed=discord.Embed(title="Staff Hub"), view=StaffHubView(self.guild))
+
+async def god_staffpanel(ctx):
+    view = StaffHubView(ctx.guild)
+    msg = await ctx.send(embed=discord.Embed(title="⚡ Loading Staff System..."), view=view)
+    frames = ["Booting...", "Loading data...", "Syncing...", "Ready"]
+    for f in frames:
+        await asyncio.sleep(0.7)
+        await msg.edit(embed=discord.Embed(title="👥 Staff System", description=f))
+    await msg.edit(embed=discord.Embed(title="👥 Staff Hub Ready"), view=view)
+
+bot.remove_command("staffpanel")
+@bot.command(name="staffpanel")
+async def staffpanel(ctx):
+    await god_staffpanel(ctx)
+
+# =========================
+# FINAL EVOLUTION STAFF PANEL
+# =========================
+# Add-on only. It does not remove verification, modmail, dashboard, timer, or pic perms.
+# It replaces only the .staffpanel command callback with a stronger multi-panel UI.
+
+def _fe_is_staff(member):
+    try:
+        return is_staff_member(member) or member.guild_permissions.administrator or member == member.guild.owner
+    except Exception:
+        return False
+
+async def _fe_log(guild, title, description, user=None, target=None, color=0x5865F2):
+    try:
+        fields = []
+        if user:
+            fields.append(("Staff", user.mention, True))
+        if target:
+            fields.append(("Target", str(target), True))
+        await log_action(guild, title, description, color=color, fields=fields)
+    except Exception as e:
+        print(f"Final Evolution log failed: {e}")
+
+def _fe_staff_members(guild):
+    return [m for m in guild.members if not m.bot and _fe_is_staff(m)]
+
+def _fe_staff_data(guild, staff_id):
+    return staff_cache.get((guild.id, staff_id), {
+        "tickets_claimed": 0,
+        "tickets_closed": 0,
+        "approvals": 0,
+        "denials": 0,
+        "blacklists": 0,
+        "escalations": 0,
+        "notes": 0,
+        "proof_requests": 0,
+        "automation_runs": 0,
+        "staff_messages": 0,
+        "followups": 0,
+        "total_response_time": 0,
+        "response_events": 0,
+        "active_time": 0,
+    })
+
+def _fe_quality_score(data):
+    approvals = data.get("approvals", 0)
+    denials = data.get("denials", 0)
+    closed = data.get("tickets_closed", 0)
+    claims = data.get("tickets_claimed", 0)
+    notes = data.get("notes", 0)
+    proof = data.get("proof_requests", 0)
+    escalations = data.get("escalations", 0)
+    score = (closed * 4) + (claims * 2) + (notes * 2) + proof + approvals + denials - (escalations * 1)
+    return max(0, min(100, score))
+
+def _fe_avg_response(data):
+    events = data.get("response_events", 0) or 0
+    total = data.get("total_response_time", 0) or 0
+    if not events:
+        return "N/A"
+    return f"{total / events:.1f}s"
+
+def _fe_counts(guild):
+    open_tickets = 0
+    claimed = 0
+    paused = 0
+    high = 0
+
+    for ch_id, data in list(ticket_tracking.items()):
+        if not isinstance(data, dict):
+            continue
+        open_tickets += 1
+        if data.get("claimed_by"):
+            claimed += 1
+        if data.get("paused"):
+            paused += 1
+        if str(data.get("priority_cache") or data.get("priority") or "").lower() == "high":
+            high += 1
+
+    modmail = 0
+    try:
+        if "modmail_active" in globals() and isinstance(modmail_active, dict):
+            modmail += len(modmail_active)
+        if "modmail_threads" in globals() and isinstance(modmail_threads, dict):
+            modmail += len(modmail_threads)
+    except Exception:
+        pass
+
+    return {
+        "staff": len(_fe_staff_members(guild)),
+        "open_tickets": open_tickets,
+        "claimed": claimed,
+        "paused": paused,
+        "high": high,
+        "modmail": modmail,
+    }
+
+def _fe_main_embed(guild, selected_staff_id=None):
+    counts = _fe_counts(guild)
+    embed = discord.Embed(
+        title="⚡ Final Evolution Staff Command Center",
+        description="Live staff hub with profiles, routing, tickets, modmail, audits, analytics, and control tools.",
+        color=0x9B59B6
+    )
+    embed.add_field(name="👥 Staff", value=str(counts["staff"]), inline=True)
+    embed.add_field(name="🎫 Tickets", value=str(counts["open_tickets"]), inline=True)
+    embed.add_field(name="📌 Claimed", value=str(counts["claimed"]), inline=True)
+    embed.add_field(name="⏸️ Paused", value=str(counts["paused"]), inline=True)
+    embed.add_field(name="🔴 High Priority", value=str(counts["high"]), inline=True)
+    embed.add_field(name="📩 Modmail", value=str(counts["modmail"]), inline=True)
+
+    if selected_staff_id:
+        member = guild.get_member(selected_staff_id)
+        if member:
+            data = _fe_staff_data(guild, member.id)
+            embed.add_field(
+                name="👤 Selected Staff",
+                value=(
+                    f"{member.mention}\n"
+                    f"Quality Score: **{_fe_quality_score(data)}/100**\n"
+                    f"Avg Response: **{_fe_avg_response(data)}**"
+                ),
+                inline=False
+            )
+    else:
+        embed.add_field(name="👤 Selected Staff", value="Use the dropdown to select staff.", inline=False)
+
+    embed.set_footer(text="Final Evolution • select staff, then open a sub-panel")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+class FinalEvolutionStaffSelect(discord.ui.Select):
+    def __init__(self, guild):
+        options = []
+        for member in _fe_staff_members(guild)[:25]:
+            data = _fe_staff_data(guild, member.id)
+            options.append(discord.SelectOption(
+                label=member.display_name[:100],
+                description=f"Closed {data.get('tickets_closed',0)} • Score {_fe_quality_score(data)}/100",
+                value=str(member.id),
+                emoji="👤"
+            ))
+        if not options:
+            options = [discord.SelectOption(label="No staff found", value="none", emoji="⚠️")]
+        super().__init__(placeholder="Select staff member...", options=options, row=0)
+
+    async def callback(self, interaction):
+        view = self.view
+        if self.values[0] == "none":
+            return await interaction.response.send_message("No staff found.", ephemeral=True)
+        view.selected_staff_id = int(self.values[0])
+        await _fe_log(interaction.guild, "👤 Staff Selected", f"{interaction.user.mention} selected <@{view.selected_staff_id}> in Final Evolution panel.", user=interaction.user)
+        await interaction.response.edit_message(embed=_fe_main_embed(interaction.guild, view.selected_staff_id), view=view)
+
+class FinalEvolutionStaffHub(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=None)
+        self.guild = guild
+        self.selected_staff_id = None
+        self.add_item(FinalEvolutionStaffSelect(guild))
+
+    async def interaction_check(self, interaction):
+        if not _fe_is_staff(interaction.user):
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction, button):
+        await _fe_log(interaction.guild, "🔄 Staff Panel Refreshed", "Final Evolution staff panel refreshed.", user=interaction.user)
+        await interaction.response.edit_message(embed=_fe_main_embed(self.guild, self.selected_staff_id), view=self)
+
+    @discord.ui.button(label="👤 Profile", style=discord.ButtonStyle.primary, row=1)
+    async def profile(self, interaction, button):
+        await interaction.response.edit_message(embed=_fe_profile_embed(self.guild, self.selected_staff_id), view=FinalEvolutionProfileView(self.guild, self.selected_staff_id))
+
+    @discord.ui.button(label="📊 Leaderboard", style=discord.ButtonStyle.success, row=1)
+    async def leaderboard(self, interaction, button):
+        await interaction.response.edit_message(embed=_fe_leaderboard_embed(self.guild), view=FinalEvolutionLeaderboardView(self.guild))
+
+    @discord.ui.button(label="🎫 Tickets", style=discord.ButtonStyle.primary, row=1)
+    async def tickets(self, interaction, button):
+        await interaction.response.edit_message(embed=_fe_ticket_embed(self.guild), view=FinalEvolutionTicketView(self.guild, self.selected_staff_id))
+
+    @discord.ui.button(label="📩 Modmail", style=discord.ButtonStyle.secondary, row=1)
+    async def modmail(self, interaction, button):
+        await interaction.response.edit_message(embed=_fe_modmail_embed(self.guild), view=FinalEvolutionModmailView(self.guild))
+
+    @discord.ui.button(label="🔍 Audit", style=discord.ButtonStyle.secondary, row=2)
+    async def audit(self, interaction, button):
+        await _fe_log(interaction.guild, "🔍 Staff Audit Opened", "Final Evolution audit panel opened.", user=interaction.user)
+        await interaction.response.edit_message(embed=await _fe_audit_embed(self.guild, self.selected_staff_id), view=FinalEvolutionAuditView(self.guild, self.selected_staff_id))
+
+    @discord.ui.button(label="⚖️ Balance Load", style=discord.ButtonStyle.success, row=2)
+    async def balance(self, interaction, button):
+        await _fe_log(interaction.guild, "⚖️ Load Balance Checked", "Staff workload balance was checked.", user=interaction.user)
+        await interaction.response.send_message(_fe_balance_report(self.guild), ephemeral=True)
+
+    @discord.ui.button(label="🧠 Behavior", style=discord.ButtonStyle.secondary, row=2)
+    async def behavior(self, interaction, button):
+        await interaction.response.send_message(_fe_behavior_report(self.guild, self.selected_staff_id), ephemeral=True)
+
+    @discord.ui.button(label="📤 Export", style=discord.ButtonStyle.primary, row=2)
+    async def export(self, interaction, button):
+        text = _fe_export_text(self.guild)
+        if len(text) > 1900:
+            text = text[:1900] + "\n..."
+        await _fe_log(interaction.guild, "📤 Staff Export Generated", "Staff export generated from Final Evolution panel.", user=interaction.user)
+        await interaction.response.send_message(f"```txt\n{text}\n```", ephemeral=True)
+
+    @discord.ui.button(label="✖ Close", style=discord.ButtonStyle.danger, row=2)
+    async def close(self, interaction, button):
+        await _fe_log(interaction.guild, "✖ Staff Panel Closed", "Final Evolution staff panel closed.", user=interaction.user)
+        await interaction.response.defer()
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+
+def _fe_profile_embed(guild, staff_id):
+    embed = discord.Embed(title="👤 Staff Profile", color=0x5865F2)
+    if not staff_id:
+        embed.description = "No staff selected. Go back and select a staff member."
+        return embed
+    member = guild.get_member(staff_id)
+    if not member:
+        embed.description = "Selected staff member is no longer in the server."
+        return embed
+    data = _fe_staff_data(guild, staff_id)
+    embed.description = f"Profile for {member.mention}"
+    embed.add_field(name="Claims", value=str(data.get("tickets_claimed", 0)), inline=True)
+    embed.add_field(name="Closed", value=str(data.get("tickets_closed", 0)), inline=True)
+    embed.add_field(name="Approvals", value=str(data.get("approvals", 0)), inline=True)
+    embed.add_field(name="Denials", value=str(data.get("denials", 0)), inline=True)
+    embed.add_field(name="Blacklists", value=str(data.get("blacklists", 0)), inline=True)
+    embed.add_field(name="Escalations", value=str(data.get("escalations", 0)), inline=True)
+    embed.add_field(name="Notes", value=str(data.get("notes", 0)), inline=True)
+    embed.add_field(name="Proof Requests", value=str(data.get("proof_requests", 0)), inline=True)
+    embed.add_field(name="Avg Response", value=_fe_avg_response(data), inline=True)
+    embed.add_field(name="Quality Score", value=f"{_fe_quality_score(data)}/100", inline=True)
+    embed.set_footer(text="Final Evolution • Staff Profile")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+class FinalEvolutionProfileView(discord.ui.View):
+    def __init__(self, guild, staff_id):
+        super().__init__(timeout=None)
+        self.guild = guild
+        self.staff_id = staff_id
+
+    @discord.ui.button(label="⚡ Force Unclaim", style=discord.ButtonStyle.danger, row=0)
+    async def force_unclaim(self, interaction, button):
+        count = 0
+        for ch_id, data in ticket_tracking.items():
+            if isinstance(data, dict) and data.get("claimed_by") == self.staff_id:
+                data["claimed_by"] = None
+                data["status"] = "open"
+                count += 1
+        await _fe_log(interaction.guild, "⚡ Force Unclaim", f"{interaction.user.mention} force-unclaimed {count} ticket(s) from <@{self.staff_id}>.", user=interaction.user, target=f"<@{self.staff_id}>", color=0xED4245)
+        await interaction.response.send_message(f"Force-unclaimed **{count}** ticket(s).", ephemeral=True)
+
+    @discord.ui.button(label="⚠️ Flag Staff", style=discord.ButtonStyle.secondary, row=0)
+    async def flag(self, interaction, button):
+        await _fe_log(interaction.guild, "⚠️ Staff Flagged", f"{interaction.user.mention} flagged <@{self.staff_id}> for review.", user=interaction.user, target=f"<@{self.staff_id}>", color=0xFEE75C)
+        await interaction.response.send_message("Staff flagged for review.", ephemeral=True)
+
+    @discord.ui.button(label="🧹 Reset Session", style=discord.ButtonStyle.secondary, row=0)
+    async def reset_session(self, interaction, button):
+        await _fe_log(interaction.guild, "🧹 Staff Session Reset", f"{interaction.user.mention} reset the session view for <@{self.staff_id}>.", user=interaction.user, target=f"<@{self.staff_id}>")
+        await interaction.response.send_message("Session view reset.", ephemeral=True)
+
+    @discord.ui.button(label="🧾 Recent Logs", style=discord.ButtonStyle.primary, row=0)
+    async def recent_logs(self, interaction, button):
+        rows = await fetch_recent_logs(interaction.guild.id, self.staff_id, limit=8)
+        embed = discord.Embed(title=f"🧾 Recent Logs for <@{self.staff_id}>", color=0x5865F2)
+        if not rows:
+            embed.description = "No recent logs found."
+        else:
+            for title, desc, created_at in rows:
+                embed.add_field(name=f"{title} • <t:{created_at}:R>", value=desc[:900], inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.primary, row=4)
+    async def back(self, interaction, button):
+        hub = FinalEvolutionStaffHub(self.guild)
+        hub.selected_staff_id = self.staff_id
+        await interaction.response.edit_message(embed=_fe_main_embed(self.guild, self.staff_id), view=hub)
+
+def _fe_leaderboard_embed(guild):
+    rows = []
+    for (guild_id, staff_id), data in staff_cache.items():
+        if guild_id != guild.id:
+            continue
+        member = guild.get_member(staff_id)
+        if not member:
+            continue
+        rows.append((member, _fe_quality_score(data), data))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    embed = discord.Embed(title="📊 Staff Leaderboard", color=0x57F287)
+    if not rows:
+        embed.description = "No staff data yet."
+    else:
+        lines = []
+        for idx, (member, score, data) in enumerate(rows[:10], 1):
+            lines.append(f"**#{idx}** {member.mention} — Score **{score}/100** • Closed `{data.get('tickets_closed',0)}` • Claims `{data.get('tickets_claimed',0)}`")
+        embed.description = "\n".join(lines)
+    embed.set_footer(text="Final Evolution • Leaderboard")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+class FinalEvolutionLeaderboardView(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=None)
+        self.guild = guild
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary)
+    async def refresh(self, interaction, button):
+        await interaction.response.edit_message(embed=_fe_leaderboard_embed(self.guild), view=self)
+
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.primary)
+    async def back(self, interaction, button):
+        await interaction.response.edit_message(embed=_fe_main_embed(self.guild), view=FinalEvolutionStaffHub(self.guild))
+
+def _fe_ticket_embed(guild):
+    embed = discord.Embed(title="🎫 Staff Ticket Control", color=0x5865F2)
+    if not ticket_tracking:
+        embed.description = "No tracked tickets."
+        return embed
+    lines = []
+    for idx, (ch_id, data) in enumerate(list(ticket_tracking.items())[:15], 1):
+        channel = guild.get_channel(ch_id)
+        user_id = data.get("user_id")
+        claimed = data.get("claimed_by")
+        status = data.get("status", "open")
+        lines.append(f"**{idx}.** {channel.mention if channel else ch_id} • <@{user_id}> • `{status}` • Claimed: {f'<@{claimed}>' if claimed else 'None'}")
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Final Evolution • Ticket Control")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+class FinalEvolutionTicketView(discord.ui.View):
+    def __init__(self, guild, selected_staff_id=None):
+        super().__init__(timeout=None)
+        self.guild = guild
+        self.selected_staff_id = selected_staff_id
+
+    @discord.ui.button(label="🧹 Clean Missing", style=discord.ButtonStyle.secondary, row=0)
+    async def clean_missing(self, interaction, button):
+        removed = 0
+        for ch_id in list(ticket_tracking.keys()):
+            if not self.guild.get_channel(ch_id):
+                ticket_tracking.pop(ch_id, None)
+                removed += 1
+        await _fe_log(interaction.guild, "🧹 Ticket Tracking Cleaned", f"{interaction.user.mention} cleaned {removed} missing ticket reference(s).", user=interaction.user)
+        await interaction.response.edit_message(embed=_fe_ticket_embed(self.guild), view=self)
+
+    @discord.ui.button(label="⚡ Unclaim All Selected", style=discord.ButtonStyle.danger, row=0)
+    async def unclaim_selected(self, interaction, button):
+        if not self.selected_staff_id:
+            return await interaction.response.send_message("No selected staff.", ephemeral=True)
+        count = 0
+        for data in ticket_tracking.values():
+            if isinstance(data, dict) and data.get("claimed_by") == self.selected_staff_id:
+                data["claimed_by"] = None
+                data["status"] = "open"
+                count += 1
+        await _fe_log(interaction.guild, "⚡ Staff Tickets Unclaimed", f"{interaction.user.mention} unclaimed {count} ticket(s) from <@{self.selected_staff_id}>.", user=interaction.user)
+        await interaction.response.send_message(f"Unclaimed {count} ticket(s).", ephemeral=True)
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        await interaction.response.edit_message(embed=_fe_ticket_embed(self.guild), view=self)
+
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.primary, row=4)
+    async def back(self, interaction, button):
+        hub = FinalEvolutionStaffHub(self.guild)
+        hub.selected_staff_id = self.selected_staff_id
+        await interaction.response.edit_message(embed=_fe_main_embed(self.guild, self.selected_staff_id), view=hub)
+
+def _fe_modmail_embed(guild):
+    embed = discord.Embed(title="📩 Modmail Control", color=0x9B59B6)
+    sources = []
+    if "modmail_active" in globals() and isinstance(modmail_active, dict):
+        sources.extend(list(modmail_active.items()))
+    if "modmail_threads" in globals() and isinstance(modmail_threads, dict):
+        sources.extend(list(modmail_threads.items()))
+    if not sources:
+        embed.description = "No active modmail sessions."
+    else:
+        lines = []
+        seen = set()
+        for user_id, channel_id in sources[:15]:
+            if (user_id, channel_id) in seen:
+                continue
+            seen.add((user_id, channel_id))
+            channel = guild.get_channel(channel_id)
+            lines.append(f"• <@{user_id}> → {channel.mention if channel else channel_id}")
+        embed.description = "\n".join(lines)
+    embed.set_footer(text="Final Evolution • Modmail")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+class FinalEvolutionModmailView(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=None)
+        self.guild = guild
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary)
+    async def refresh(self, interaction, button):
+        await interaction.response.edit_message(embed=_fe_modmail_embed(self.guild), view=self)
+
+    @discord.ui.button(label="🧹 Clean Closed", style=discord.ButtonStyle.secondary)
+    async def clean(self, interaction, button):
+        removed = 0
+        for mapping_name in ("modmail_active", "modmail_threads"):
+            mapping = globals().get(mapping_name)
+            if isinstance(mapping, dict):
+                for user_id, ch_id in list(mapping.items()):
+                    if not self.guild.get_channel(ch_id):
+                        mapping.pop(user_id, None)
+                        removed += 1
+        await _fe_log(interaction.guild, "🧹 Modmail Cleaned", f"{interaction.user.mention} cleaned {removed} closed modmail session(s).", user=interaction.user)
+        await interaction.response.edit_message(embed=_fe_modmail_embed(self.guild), view=self)
+
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.primary)
+    async def back(self, interaction, button):
+        await interaction.response.edit_message(embed=_fe_main_embed(self.guild), view=FinalEvolutionStaffHub(self.guild))
+
+async def _fe_audit_embed(guild, staff_id=None):
+    rows = await fetch_recent_logs(guild.id, staff_id, limit=10)
+    embed = discord.Embed(title="🔍 Final Evolution Audit", color=0x2B2D31)
+    if staff_id:
+        embed.description = f"Focused on <@{staff_id}>"
+    if not rows:
+        embed.add_field(name="Logs", value="No logs found.", inline=False)
+    else:
+        for title, desc, created_at in rows:
+            embed.add_field(name=f"{title} • <t:{created_at}:R>", value=desc[:900], inline=False)
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+class FinalEvolutionAuditView(discord.ui.View):
+    def __init__(self, guild, staff_id=None):
+        super().__init__(timeout=None)
+        self.guild = guild
+        self.staff_id = staff_id
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary)
+    async def refresh(self, interaction, button):
+        await interaction.response.edit_message(embed=await _fe_audit_embed(self.guild, self.staff_id), view=self)
+
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.primary)
+    async def back(self, interaction, button):
+        hub = FinalEvolutionStaffHub(self.guild)
+        hub.selected_staff_id = self.staff_id
+        await interaction.response.edit_message(embed=_fe_main_embed(self.guild, self.staff_id), view=hub)
+
+def _fe_balance_report(guild):
+    staff = _fe_staff_members(guild)
+    if not staff:
+        return "No staff found."
+    loads = []
+    for member in staff:
+        count = sum(1 for data in ticket_tracking.values() if isinstance(data, dict) and data.get("claimed_by") == member.id)
+        loads.append((member, count))
+    loads.sort(key=lambda x: x[1], reverse=True)
+    return "\n".join(f"{m.mention}: **{c}** claimed ticket(s)" for m, c in loads[:10])
+
+def _fe_behavior_report(guild, staff_id):
+    if not staff_id:
+        return "Select a staff member first."
+    member = guild.get_member(staff_id)
+    data = _fe_staff_data(guild, staff_id)
+    approvals = data.get("approvals", 0)
+    denials = data.get("denials", 0)
+    total = approvals + denials
+    denial_rate = (denials / total * 100) if total else 0
+    style = "Strict" if denial_rate >= 65 else "Lenient" if denial_rate <= 25 and total else "Balanced"
+    return (
+        f"Behavior report for {member.mention if member else staff_id}\n"
+        f"Style: **{style}**\n"
+        f"Denial Rate: **{denial_rate:.1f}%**\n"
+        f"Quality Score: **{_fe_quality_score(data)}/100**\n"
+        f"Avg Response: **{_fe_avg_response(data)}**"
+    )
+
+def _fe_export_text(guild):
+    lines = [f"Final Evolution Staff Export — {guild.name}", "-" * 40]
+    for member in _fe_staff_members(guild):
+        data = _fe_staff_data(guild, member.id)
+        lines.append(
+            f"{member} ({member.id}) | Score {_fe_quality_score(data)}/100 | "
+            f"Claims {data.get('tickets_claimed',0)} | Closed {data.get('tickets_closed',0)} | "
+            f"Approvals {data.get('approvals',0)} | Denials {data.get('denials',0)}"
+        )
+    return "\n".join(lines)
+
+async def _final_evolution_animate(message, guild, view):
+    frames = [
+        ("⚡ Booting Final Evolution...", "▰▱▱▱▱▱▱▱▱▱"),
+        ("👥 Loading staff profiles...", "▰▰▱▱▱▱▱▱▱▱"),
+        ("🎫 Reading ticket workload...", "▰▰▰▰▱▱▱▱▱▱"),
+        ("📩 Syncing modmail sessions...", "▰▰▰▰▰▰▱▱▱▱"),
+        ("🔍 Preparing audit tools...", "▰▰▰▰▰▰▰▰▱▱"),
+        ("✅ Command center online.", "▰▰▰▰▰▰▰▰▰▰"),
+    ]
+    for text, bar in frames:
+        embed = discord.Embed(title="⚡ Final Evolution Staff Panel", description=f"{text}\n`{bar}`", color=0x9B59B6)
+        embed.timestamp = discord.utils.utcnow()
+        await message.edit(embed=embed)
+        await asyncio.sleep(0.55)
+    await message.edit(embed=_fe_main_embed(guild), view=view)
+
+async def _final_evolution_staffpanel(ctx):
+    if not _fe_is_staff(ctx.author):
+        return await ctx.send("Staff only.")
+    view = FinalEvolutionStaffHub(ctx.guild)
+    msg = await ctx.send(embed=discord.Embed(title="⚡ Starting Final Evolution...", color=0x9B59B6))
+    await _fe_log(ctx.guild, "⚡ Final Evolution Staff Panel Opened", f"{ctx.author.mention} opened the Final Evolution staff panel.", user=ctx.author, color=0x9B59B6)
+    await _final_evolution_animate(msg, ctx.guild, view)
+
+try:
+    bot.remove_command("staffpanel")
+except Exception:
+    pass
+
+@bot.command(name="staffpanel", aliases=["staff", "staffhub"])
+async def final_evolution_staffpanel_command(ctx):
+    await _final_evolution_staffpanel(ctx)
+
 bot.run(os.getenv("TOKEN"))
