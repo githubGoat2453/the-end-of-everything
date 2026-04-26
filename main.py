@@ -6561,4 +6561,160 @@ async def auto_kick_if_unverified(member_id, guild_id, delay=600):
         await remove_from_verification(member_id, guild_id)
         return
 
+# =========================
+# FINAL PIC PERMS OVERRIDES
+# =========================
+PIC_PERMS_ROLE_ID = 1489476010725609535
+
+async def give_pic_perms(member):
+    if not member or not member.guild:
+        return False
+    role = member.guild.get_role(PIC_PERMS_ROLE_ID)
+    if not role:
+        return False
+    if role in member.roles:
+        return True
+    try:
+        await member.add_roles(role, reason="Auto pic perms on join")
+        return True
+    except Exception as e:
+        print(f"Failed to give pic perms to {member}: {e}")
+        return False
+
+async def remove_pic_perms(member, reason="Verification ended"):
+    if not member or not member.guild:
+        return False
+    role = member.guild.get_role(PIC_PERMS_ROLE_ID)
+    if not role:
+        return False
+    if role not in member.roles:
+        return True
+    try:
+        await member.remove_roles(role, reason=reason)
+        return True
+    except Exception as e:
+        print(f"Failed to remove pic perms from {member}: {e}")
+        return False
+
+async def _dashboard_remove_pic_perms(guild, member):
+    await remove_pic_perms(member, reason="Dashboard verification action")
+
+_original_on_member_join = on_member_join
+
+@bot.event
+async def on_member_join(member):
+    await give_pic_perms(member)
+    await _original_on_member_join(member)
+
+_original_ticket_approve = TicketControls.approve
+_original_ticket_deny = TicketControls.deny
+_original_ticket_blacklist = TicketControls.blacklist
+
+async def _picperms_approve_wrapper(self, interaction, button):
+    member = interaction.guild.get_member(self.user_id)
+    if member:
+        await remove_pic_perms(member, reason="Approved verification")
+    return await _original_ticket_approve(self, interaction, button)
+
+async def _picperms_deny_wrapper(self, interaction, button):
+    member = interaction.guild.get_member(self.user_id)
+    if member:
+        await remove_pic_perms(member, reason="Denied verification")
+    return await _original_ticket_deny(self, interaction, button)
+
+async def _picperms_blacklist_wrapper(self, interaction, button):
+    member = interaction.guild.get_member(self.user_id)
+    if member:
+        await remove_pic_perms(member, reason="Blacklisted verification")
+    return await _original_ticket_blacklist(self, interaction, button)
+
+TicketControls.approve = _picperms_approve_wrapper
+TicketControls.deny = _picperms_deny_wrapper
+TicketControls.blacklist = _picperms_blacklist_wrapper
+
+_original_auto_judge_auto_approve = AutoJudge.auto_approve
+
+async def _picperms_auto_judge_auto_approve(self):
+    await remove_pic_perms(self.member, reason="Auto Judge approved")
+    return await _original_auto_judge_auto_approve(self)
+
+AutoJudge.auto_approve = _picperms_auto_judge_auto_approve
+
+async def auto_kick_if_unverified(member_id, guild_id, delay=600):
+    await asyncio.sleep(5)
+
+    while True:
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            return
+
+        member = guild.get_member(member_id)
+        if not member:
+            return
+
+        guild_cfg = get_guild_config(guild.id)
+        stats = get_daily_stats(guild.id)
+
+        unverified_role = guild.get_role(guild_cfg["unverified_role"]) if guild_cfg.get("unverified_role") else None
+        if not unverified_role or unverified_role not in member.roles:
+            await remove_pic_perms(member, reason="Verification no longer active")
+            return
+
+        row = await _get_active_verification_row(guild_id, member_id)
+        ticket_channel_id = row[0] if row else None
+        db_expires_ts = row[1] if row else None
+        db_status = (row[2] or "").lower() if row else ""
+
+        data = ticket_tracking.get(ticket_channel_id, {}) if ticket_channel_id else {}
+
+        if data.get("paused") or db_status == "paused":
+            await asyncio.sleep(5)
+            continue
+
+        expires_ts = data.get("expires_timestamp") or db_expires_ts
+        if not expires_ts:
+            await asyncio.sleep(5)
+            continue
+
+        if time.time() < int(expires_ts):
+            await asyncio.sleep(min(5, max(1, int(expires_ts - time.time()))))
+            continue
+
+        row = await _get_active_verification_row(guild_id, member_id)
+        db_status = (row[2] or "").lower() if row else ""
+        data = ticket_tracking.get(ticket_channel_id, {}) if ticket_channel_id else {}
+        if data.get("paused") or db_status == "paused":
+            await asyncio.sleep(5)
+            continue
+
+        await remove_pic_perms(member, reason="Verification timeout")
+
+        try:
+            await member.send("⏰ You did not complete verification in time and were removed from the server.")
+        except Exception:
+            pass
+
+        try:
+            await member.kick(reason="Verification timeout")
+        except Exception as e:
+            print(f"Timeout kick failed: {e}")
+            return
+
+        stats["autokicked"] += 1
+
+        await log_action(
+            guild,
+            "⏰ Auto-Kicked (Timeout)",
+            f"{member.mention} was auto-kicked for not completing verification in time.",
+            color=0xED4245,
+            fields=[
+                ("User", member.mention, True),
+                ("User ID", str(member.id), True),
+                ("Reason", "Verification timeout", True)
+            ]
+        )
+
+        await remove_from_verification(member_id, guild_id)
+        return
+
 bot.run(os.getenv("TOKEN"))
